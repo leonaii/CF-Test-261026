@@ -20,7 +20,18 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+)
+
+// pendingRestart 记录“更新完成后要拉起的新版本”，由 main 在界面退出后启动。
+var pendingRestart atomic.Value // string
+
+// 本进程已经替换到的版本 + 单飞锁（首次界面和主界面可能同时触发检查）
+var (
+	updateMu      sync.Mutex
+	updateApplied atomic.Value // string
 )
 
 const (
@@ -117,12 +128,21 @@ func downloadUpdate(ctx context.Context, curExe string, m *updateManifestFile) (
 // 失败会自动回滚，保证原来还能启动。
 func applyUpdate(curExe, newPath string) error {
 	old := curExe + ".old"
-	_ = os.Remove(old) // 上一次的残留；删不掉就换个名字
+
+	// 只使用固定的 .old 名字：删不掉就跳过本次更新，绝不生成第二个文件
+	for i := 0; i < 10; i++ {
+		if _, err := os.Stat(old); os.IsNotExist(err) {
+			break
+		}
+		if os.Remove(old) == nil {
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 	if _, err := os.Stat(old); err == nil {
-		old = fmt.Sprintf("%s.%d", old, time.Now().Unix())
+		return errors.New("旧版本文件仍被占用，本次跳过更新")
 	}
 
-	// 杀软/索引服务可能短暂占用，重试几次
 	var err error
 	for i := 0; i < 5; i++ {
 		if err = os.Rename(curExe, old); err == nil {
@@ -145,16 +165,115 @@ func applyUpdate(curExe, newPath string) error {
 }
 
 // cleanupOldExe 启动时删掉上一次替换留下的 .old（失败忽略）。
-func cleanupOldExe() {
+// cleanupOldExe 清理上次更新留下的 CG.exe.old / CG.exe.old.* / CG.update.tmp。
+// 新进程刚起来时旧进程可能还没完全退出，删不掉就后台持续重试，最多约 30 秒。
+// cleanupOldExe 启动时清理上次更新留下的 CG.exe.old / .old.* / CG.update.tmp。
+// 旧进程可能还没完全退出，删不掉就后台重试；仍删不掉就交给系统在本进程退出后删除。
+func cleanupOldExe(logf func(string, ...any)) {
 	exe, err := os.Executable()
 	if err != nil {
 		return
 	}
-	_ = os.Remove(exe + ".old")
-	if matches, err := filepath.Glob(exe + ".old.*"); err == nil {
-		for _, p := range matches {
-			_ = os.Remove(p)
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+
+	left := cleanupArtifacts(exe)
+	if len(left) == 0 {
+		return
+	}
+	logf("旧版本文件暂未释放，稍后重试删除: %s", strings.Join(left, ", "))
+
+	go func() {
+		for i := 0; i < 10 && len(left) > 0; i++ {
+			time.Sleep(1500 * time.Millisecond)
+			left = cleanupArtifacts(exe)
+		}
+		if len(left) == 0 {
+			return
+		}
+		// 还在被占用（比如本进程就是从这个文件启动的）：交给系统在退出后删除
+		scheduleDelayedDelete(left)
+	}()
+}
+
+// cleanupArtifacts 删除指定 exe 对应的一批遗留文件，返回没删掉的。
+func cleanupArtifacts(exe string) []string {
+	targets := []string{exe + ".old", filepath.Join(filepath.Dir(exe), "CG.update.tmp")}
+	if matches, e := filepath.Glob(exe + ".old.*"); e == nil {
+		targets = append(targets, matches...)
+	}
+	var left []string
+	for _, p := range targets {
+		if _, e := os.Stat(p); e != nil {
+			continue
+		}
+		_ = os.Chmod(p, 0o600) // 去掉只读属性，否则删不掉
+		if os.Remove(p) != nil {
+			left = append(left, p)
 		}
 	}
-	_ = os.Remove(filepath.Join(filepath.Dir(exe), "CG.update.tmp"))
+	return left
+}
+
+// updateEvents 把更新进度广播给第一界面（无人监听时丢弃）。
+var updateEvents = make(chan string, 32)
+
+func emitUpdate(msg string) {
+	select {
+	case updateEvents <- msg:
+	default:
+	}
+}
+
+// appliedVersion 返回本进程已替换到的版本（"" 表示没更新）。
+func appliedVersion() string {
+	v, _ := updateApplied.Load().(string)
+	return v
+}
+
+// checkUpdateCore 检查并替换当前 exe，返回本次生效的版本（"" 表示没有更新）。
+// 全程加锁：首次配置窗口和主界面同时触发时只会下载一次。
+func checkUpdateCore(logf func(string, ...any)) (string, error) {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	updateMu.Lock()
+	defer updateMu.Unlock()
+
+	// 本进程已经换过一次了（比如首配窗口里换的），直接返回
+	if v, _ := updateApplied.Load().(string); v != "" {
+		return v, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	m, err := fetchUpdateManifest(ctx)
+	if err != nil {
+		if errors.Is(err, errCloudNotFound) {
+			return "", nil
+		}
+		return "", err
+	}
+	if !versionNewer(m.Version, toolVersion) {
+		return "", nil
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	logf("发现新版本 v%s，开始下载…", m.Version)
+
+	tmp, err := downloadUpdate(ctx, exe, m)
+	if err != nil {
+		return "", err
+	}
+	if err := applyUpdate(exe, tmp); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	updateApplied.Store(m.Version)
+	return m.Version, nil
 }

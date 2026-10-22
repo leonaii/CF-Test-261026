@@ -58,6 +58,8 @@ func main() {
 			usage()
 			os.Exit(2)
 		}
+		// 更新完成：界面已退出，这里拉起新版本
+		restartIfNeeded()
 		return
 	}
 	var err error
@@ -82,6 +84,8 @@ func main() {
 		err = cmdPull(os.Args[2:])
 	case "cloud":
 		err = cmdCloud(os.Args[2:])
+	case "clean":
+		err = cmdClean()
 	case "version", "-v", "--version":
 		fmt.Println("CG", toolVersion)
 	case "help", "-h", "--help":
@@ -526,6 +530,36 @@ func cmdCloud(args []string) error {
 	fmt.Printf("%-4s %-18s %-12s %-6s %s\n", "#", "CARD", "QQ", "标记", "录制时间")
 	for i, e := range idx.Cards {
 		fmt.Printf("%-4d %-18s %-12s %-6s %s\n", i+1, e.Card, e.QQ, markLabel(e.Mark), e.Recorded)
+	}
+	return nil
+}
+
+// cmdClean 清理更新残留文件（程序被占用时提示关闭后再试）。
+func cmdClean() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(exe)
+	total := 0
+	for _, base := range []string{"CG.exe", "CG-cli.exe"} {
+		p := filepath.Join(dir, base)
+		before := 0
+		if matches, _ := filepath.Glob(p + ".old*"); len(matches) > 0 {
+			before = len(matches)
+		}
+		left := cleanupArtifacts(p)
+		done := before - len(left)
+		total += done
+		if done > 0 {
+			logf("已清理 %s 的 %d 个残留文件", base, done)
+		}
+		for _, f := range left {
+			logf("删除失败（可能仍在运行）: %s", f)
+		}
+	}
+	if total == 0 {
+		logf("没有需要清理的文件")
 	}
 	return nil
 }

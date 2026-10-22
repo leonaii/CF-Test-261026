@@ -6,7 +6,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -32,19 +31,24 @@ type accountModel struct {
 
 // StyleCell 给“状态”列上色：正常绿、封禁红、黑屋橙、过期灰、其他蓝。
 func (m *accountModel) StyleCell(style *walk.CellStyle) {
-	if style.Col() != 0 || m.cfg == nil {
+	if m.cfg == nil {
 		return
 	}
 	row := style.Row()
 	if row < 0 || row >= len(m.rows) {
 		return
 	}
-	if m.rows[row].Remote {
-		style.BackgroundColor = walk.RGB(120, 120, 120)
-		style.TextColor = walk.RGB(255, 255, 255)
+	r := m.rows[row]
+
+	// 只在云端、还没下载到本地的行：其它列灰显，提示“点启动会自动下载”
+	if style.Col() != 0 {
+		if r.Remote {
+			style.TextColor = walk.RGB(140, 140, 140)
+		}
 		return
 	}
-	switch m.cfg.mark(m.rows[row].Card) {
+
+	switch m.cfg.mark(r.Card) {
 	case markBan:
 		style.BackgroundColor = walk.RGB(198, 40, 40)
 		style.TextColor = walk.RGB(255, 255, 255)
@@ -72,9 +76,6 @@ func (m *accountModel) Value(row, col int) interface{} {
 	r := m.rows[row]
 	switch col {
 	case 0:
-		if r.Remote {
-			return "云端"
-		}
 		if m.cfg != nil {
 			return markLabel(m.cfg.mark(r.Card))
 		}
@@ -109,6 +110,11 @@ type guiApp struct {
 	btnReplay       *walk.PushButton
 	btnChoose       *walk.PushButton
 	headLabel       *walk.Label
+	headSub         *walk.Label
+	siteEdit        *walk.LineEdit
+	btnCopySite     *walk.PushButton
+	btnOpenSite     *walk.PushButton
+	verLabel        *walk.Label
 	btnRefresh      *walk.PushButton
 	btnMark         *walk.PushButton
 	btnCloudRefresh *walk.PushButton
@@ -123,17 +129,18 @@ type guiApp struct {
 	profile  *loaderProfile
 	firstRun bool
 
-	host       *HostDatManager
-	srvMu      sync.Mutex
-	srv        *Server
-	busy       bool
-	runLog     *runLogger
-	logErr     error
-	closing    atomic.Bool
-	loadGen    int64
-	uiLogLines int
-	selectTop  atomic.Bool
-	cloudIdx   *cloudIndex // 只在界面线程读写
+	host        *HostDatManager
+	srvMu       sync.Mutex
+	srv         *Server
+	busy        bool
+	runLog      *runLogger
+	logErr      error
+	closing     atomic.Bool
+	loadGen     int64
+	uiLogLines  int
+	selectTop   atomic.Bool
+	cloudIdx    *cloudIndex // 只在界面线程读写
+	loaderReady atomic.Bool
 }
 
 func runGUI() (err error) {
@@ -149,9 +156,39 @@ func runGUI() (err error) {
 	}()
 	trace.printf("启动 CG v%s", toolVersion)
 
-	cleanupOldExe()
+	// 首次配置窗口也检查更新：后台执行，进度显示在第一界面上
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				trace.printf("检查更新异常: %v", r)
+			}
+		}()
+		emitUpdate("正在检查更新…")
+		v, err := checkUpdateCore(func(f string, args ...any) {
+			msg := fmt.Sprintf(f, args...)
+			trace.printf("%s", msg)
+			emitUpdate(msg)
+		})
+		if err != nil {
+			trace.printf("检查更新失败: %v", err)
+			emitUpdate("检查更新失败：" + err.Error())
+			return
+		}
+		if v != "" {
+			trace.printf("已更新到 v%s（首次界面）", v)
+			emitUpdate("已更新到 v" + v + "，完成配置后自动重启")
+			return
+		}
+		emitUpdate("已是最新版本 v" + toolVersion)
+	}()
+
+	cleanupOldExe(trace.printf)
 
 	cfg := loadAppConfig()
+	if old, moved := migrateWorkDir(cfg); moved {
+		trace.printf("安装目录已迁移: %s -> %s", old, cfg.WorkDir)
+	}
+
 	firstRun := false
 	if cfg == nil || cfg.WorkDir == "" || findProfile(cfg.Profile) == nil {
 		trace.printf("需要首次配置")
@@ -172,6 +209,15 @@ func runGUI() (err error) {
 			walk.MsgBox(nil, "提示", "配置无法保存，下次启动会重新询问：\n"+e.Error(), walk.MsgBoxIconWarning)
 		}
 		firstRun = true
+
+		// 首配期间已经替换好新版本：直接重启进新版本，不再用旧进程开主界面
+		if v := appliedVersion(); v != "" {
+			if exe, e := os.Executable(); e == nil {
+				trace.printf("配置完成，重启到 v%s", v)
+				pendingRestart.Store(exe)
+				return nil
+			}
+		}
 	}
 
 	trace.printf("工作目录=%s 类型=%s 卡密=%s", cfg.WorkDir, cfg.Profile, cfg.CloudName)
@@ -211,10 +257,12 @@ func (a *guiApp) init() error {
 	a.listen = "127.0.0.1:18800"
 	a.host = NewHostDatManager(filepath.Join(a.dir, "host.dat"))
 	if a.profile != nil {
-		if p, e := a.profile.ensure(a.dir, false); e != nil {
-			a.logErr = e
+		a.loader = filepath.Join(a.dir, a.profile.ExeName)
+		if ok, reason := localLoaderReady(a.dir, a.profile); ok {
+			a.loaderReady.Store(true)
 		} else {
-			a.loader = p
+			a.logErr = fmt.Errorf("%s", reason)
+			go a.syncLoaderAsync()
 		}
 	}
 	a.model = &accountModel{rows: nil, cfg: a.cfg}
@@ -228,9 +276,7 @@ func (a *guiApp) init() error {
 	if err := a.createWindow(); err != nil {
 		return err
 	}
-	if a.headLabel != nil {
-		a.headLabel.SetText(fmt.Sprintf("%s  ·  %s", a.profileName(), a.dir))
-	}
+	a.refreshHeader()
 	a.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		// 先标记关闭，后续后台协程的界面调用直接丢弃，避免关闭过程中再弹窗/改控件
 		a.closing.Store(true)
@@ -245,10 +291,10 @@ func (a *guiApp) init() error {
 	a.refreshHostState()
 	a.logf("工作目录: %s", a.dir)
 	a.logf("缓存目录: %s", a.cacheDir)
-	if a.loader != "" {
+	if a.loaderReady.Load() {
 		a.logf("上号器: %s", a.loader)
 	} else {
-		a.logf("上号器还没解压成功，请在“录制模式”里点“切换上号器”重试")
+		a.logf("上号器还没准备好（%v），正在从云端获取…", a.logErr)
 	}
 	if a.runLog != nil {
 		a.runLog.block("启动 CG v"+toolVersion,
@@ -281,14 +327,35 @@ func (a *guiApp) createWindow() error {
 		Layout:   VBox{},
 		Children: []Widget{
 			Composite{
-				Layout: HBox{},
+				Layout: HBox{Spacing: 10},
 				Children: []Widget{
-					Label{AssignTo: &a.headLabel, Text: "CG", Font: Font{PointSize: 13, Bold: true}},
+					Label{AssignTo: &a.headLabel, Text: "CG", Font: Font{PointSize: 18, Bold: true}},
+					Label{AssignTo: &a.headSub, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
 					HSpacer{},
+					Label{AssignTo: &a.verLabel, Text: "v" + toolVersion, TextColor: walk.RGB(150, 150, 150), Font: Font{PointSize: 8}},
 				},
 			},
 			Composite{
-				Layout: HBox{},
+				Layout: HBox{Spacing: 8},
+				Children: []Widget{
+					Label{Text: "购买地址", TextColor: walk.RGB(110, 110, 110), Font: Font{PointSize: 9}},
+					LineEdit{AssignTo: &a.siteEdit, ReadOnly: true, MinSize: Size{Width: 430}},
+					PushButton{AssignTo: &a.btnCopySite, Text: "复制", MinSize: Size{Width: 64}, OnClicked: func() {
+						if err := copyToClipboard(a.siteEdit.Text()); err != nil {
+							a.logf("复制购买地址失败: %v", err)
+						} else {
+							a.logf("购买地址已复制")
+						}
+					}},
+					PushButton{AssignTo: &a.btnOpenSite, Text: "打开", MinSize: Size{Width: 64}, OnClicked: func() {
+						openBrowser(a.siteEdit.Text())
+					}},
+					HSpacer{},
+				},
+			},
+			VSeparator{},
+			Composite{
+				Layout: HBox{Spacing: 6},
 				Children: []Widget{
 					PushButton{AssignTo: &a.btnRecord, Text: "录制并上号", MinSize: Size{Width: 190, Height: 38}, OnClicked: a.startRecord},
 					PushButton{AssignTo: &a.btnReplay, Text: "用选中账号上号", MinSize: Size{Width: 190, Height: 38}, OnClicked: a.startReplay},
@@ -302,6 +369,7 @@ func (a *guiApp) createWindow() error {
 			TableView{
 				AssignTo:            &a.tv,
 				AlternatingRowBG:    true,
+				CustomRowHeight:     26,
 				LastColumnStretched: true,
 				Columns: []TableViewColumn{
 					{Title: "状态", Width: 70},
@@ -538,15 +606,19 @@ func (a *guiApp) applyConfig() {
 	a.dir = a.cfg.WorkDir
 	a.cacheDir = filepath.Join(a.dir, "cache")
 	a.host = NewHostDatManager(filepath.Join(a.dir, "host.dat"))
+	a.loaderReady.Store(false)
 	if a.profile != nil {
-		if p, err := a.profile.ensure(a.dir, false); err != nil {
-			a.logf("解压上号器失败: %v", err)
+		a.loader = filepath.Join(a.dir, a.profile.ExeName)
+		if ok, reason := localLoaderReady(a.dir, a.profile); ok {
+			a.loaderReady.Store(true)
 		} else {
-			a.loader = p
+			a.logf("本地上号器需要重新获取：%s", reason)
+			go a.syncLoaderAsync()
 		}
 	}
+	a.updateLoaderButtons()
 	a.logf("工作目录切换为: %s（%s）", a.dir, a.profileName())
-	a.headLabel.SetText(fmt.Sprintf("%s  ·  %s", a.profileName(), a.dir))
+	a.refreshHeader()
 	a.refreshHostState()
 	a.reloadAccounts()
 	a.refreshCloudList(false)
@@ -617,8 +689,8 @@ func (a *guiApp) downloadThenReplay(card string) {
 }
 
 func (a *guiApp) launch(record bool, card string) {
-	if a.loader == "" {
-		walk.MsgBox(a.mw, "提示", "上号器还没解压出来。\n请在“录制模式”里点“切换上号器”选择类型和目录。", walk.MsgBoxIconInformation)
+	if !a.loaderReady.Load() {
+		walk.MsgBox(a.mw, "提示", "上号器还没准备好（正在从云端下载或下载失败）。\n稍等片刻再试，或点“切换上号器”重新获取。", walk.MsgBoxIconInformation)
 		return
 	}
 	up := a.upstream()
@@ -892,7 +964,7 @@ func (a *guiApp) uploadRecordedCards(cards []string) {
 }
 
 // checkUpdate 后台检查云端更新，发现新版本就下载、校验并替换当前 exe。
-// 全流程只在后台跑，失败只写日志，不影响界面。
+// 已替换过（比如首配窗口里换的）就只负责重启。
 func (a *guiApp) checkUpdate() {
 	defer func() {
 		if r := recover(); r != nil {
@@ -900,63 +972,133 @@ func (a *guiApp) checkUpdate() {
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
-
-	m, err := fetchUpdateManifest(ctx)
+	v, err := checkUpdateCore(a.logf)
 	if err != nil {
-		if errors.Is(err, errCloudNotFound) {
-			return // 云端还没发布过版本
-		}
 		a.logf("检查更新失败: %v", err)
 		return
 	}
-	if !versionNewer(m.Version, toolVersion) {
+	if v == "" {
 		a.logf("版本 v%s 已是最新", toolVersion)
 		return
 	}
 
-	exe, err := os.Executable()
-	if err != nil {
-		a.logf("更新失败: %v", err)
-		return
-	}
-	a.logf("发现新版本 v%s，开始下载…", m.Version)
-	tmp, err := downloadUpdate(ctx, exe, m)
-	if err != nil {
-		a.logf("更新下载失败: %v", err)
-		return
-	}
-	if err := applyUpdate(exe, tmp); err != nil {
-		_ = os.Remove(tmp)
-		a.logf("更新替换失败: %v", err)
-		return
-	}
-	// 正在录制/回放、或者还停在首配窗口时，不打断用户
-	if a.busy || a.firstRun || a.closing.Load() {
-		a.logf("已更新到 v%s，下次启动生效", m.Version)
+	if a.busy || a.closing.Load() {
+		a.logf("已更新到 v%s，下次启动生效", v)
 		a.ui(func() {
-			if a.headLabel != nil {
-				a.headLabel.SetText(fmt.Sprintf("%s  ·  %s  ·  已更新 v%s", a.profileName(), a.dir, m.Version))
+			if a.headSub != nil {
+				a.headSub.SetText("  " + a.profileName() + "  ·  已更新 v" + v)
 			}
 		})
 		return
 	}
 
-	a.logf("已更新到 v%s，2 秒后自动重启", m.Version)
-	restartApp(exe)
-	time.Sleep(300 * time.Millisecond)
-	// 走正常关闭流程：还原 host.dat、写完 run.log，然后由后台命令拉起新版本
+	exe, err := os.Executable()
+	if err != nil {
+		a.logf("已更新到 v%s，下次启动生效", v)
+		return
+	}
+	a.logf("已更新到 v%s，正在重启…", v)
+	// 先正常退出（还原 host.dat、关日志），由 main 在 runGUI 返回后拉起新版本
+	pendingRestart.Store(exe)
 	a.ui(func() { _ = a.mw.Close() })
 }
 
-// restartApp 用一个分离的 cmd 延迟拉起新版本，避免和正在退出的旧进程抢 host.dat。
-func restartApp(exe string) {
-	// 用 ping 做延时（不依赖控制台），然后拉起新版本
-	cmd := exec.Command("cmd", "/c", fmt.Sprintf(`ping -n 3 127.0.0.1 >nul & start "" "%s"`, exe))
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	if err := cmd.Start(); err != nil {
+// restartIfNeeded 在界面退出后拉起刚更新好的新版本。
+func restartIfNeeded() {
+	v := pendingRestart.Load()
+	if v == nil {
 		return
 	}
-	go func() { _ = cmd.Wait() }()
+	exe, _ := v.(string)
+	if exe == "" {
+		return
+	}
+	pendingRestart.Store("")
+
+	cmd := exec.Command(exe)
+	cmd.Dir = filepath.Dir(exe)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000008} // DETACHED_PROCESS
+	if err := cmd.Start(); err == nil {
+		_ = cmd.Process.Release()
+		logRestart("已启动新版本: " + exe)
+		return
+	} else {
+		logRestart("直接启动失败: " + err.Error())
+	}
+
+	// 兜底：交给 shell 启动（CmdLine 原样传入，不经 exec 的引号转义）
+	c := exec.Command("cmd")
+	c.SysProcAttr = &syscall.SysProcAttr{
+		CmdLine:       `cmd /c start "" "` + exe + `"`,
+		HideWindow:    true,
+		CreationFlags: 0x08000000,
+	}
+	if err := c.Start(); err != nil {
+		logRestart("shell 启动也失败: " + err.Error())
+		return
+	}
+	_ = c.Process.Release()
+	logRestart("已通过 shell 启动新版本: " + exe)
+}
+
+// logRestart 重启结果写进 startup.log（此时 run.log 已关闭）。
+func logRestart(msg string) {
+	p := filepath.Join(configDirPath(), "startup.log")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s  [restart] %s\n", time.Now().Format("15:04:05"), msg)
+}
+
+// updateLoaderButtons 上号器没就绪时禁用“录制/回放”，避免点了报错。
+func (a *guiApp) updateLoaderButtons() {
+	ready := a.loaderReady.Load()
+	if a.btnRecord != nil {
+		a.btnRecord.SetEnabled(ready && !a.busy)
+	}
+	if a.btnReplay != nil {
+		a.btnReplay.SetEnabled(ready && !a.busy)
+	}
+}
+
+// syncLoaderAsync 后台从云端获取上号器与 host.dat。
+func (a *guiApp) syncLoaderAsync() {
+	defer func() {
+		if r := recover(); r != nil {
+			a.logf("获取上号器异常: %v", r)
+		}
+	}()
+	if a.profile == nil {
+		return
+	}
+	a.ui(func() { a.updateLoaderButtons() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	path, err := syncLoader(ctx, a.dir, a.profile, a.logf)
+	if err != nil {
+		a.logf("获取上号器失败: %v", err)
+		a.ui(func() {
+			walk.MsgBox(a.mw, "上号器获取失败",
+				"无法从云端获取上号器：\n"+err.Error()+"\n\n请检查网络，或点“切换上号器”重试。",
+				walk.MsgBoxIconError)
+		})
+		return
+	}
+	a.loader = path
+	a.loaderReady.Store(true)
+	a.ui(func() { a.updateLoaderButtons() })
+}
+
+// refreshHeader 刷新顶部信息：类型名 + 购买地址（不显示本地目录）。
+func (a *guiApp) refreshHeader() {
+	if a.headSub != nil {
+		a.headSub.SetText("  " + a.profileName())
+	}
+	if a.siteEdit != nil && a.profile != nil {
+		a.siteEdit.SetText(a.profile.Site)
+	}
 }

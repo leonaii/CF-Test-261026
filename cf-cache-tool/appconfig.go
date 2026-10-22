@@ -115,3 +115,38 @@ func (c *appConfig) cloudNameOrDefault() string {
 	}
 	return "cache"
 }
+
+// defaultWorkDir 默认工作目录：%AppData%\CG\data（上号器、host.dat、cache 都放这里）
+func defaultWorkDir() string {
+	return filepath.Join(configDirPath(), "data")
+}
+
+// migrateWorkDir 把老版本自定义的安装目录迁到默认目录（只复制 cache，不动原目录）。
+func migrateWorkDir(cfg *appConfig) (string, bool) {
+	if cfg == nil || cfg.WorkDir == "" {
+		return "", false
+	}
+	def := defaultWorkDir()
+	old := filepath.Clean(cfg.WorkDir)
+	if old == filepath.Clean(def) {
+		return "", false
+	}
+
+	if entries, err := os.ReadDir(filepath.Join(old, "cache")); err == nil {
+		_ = os.MkdirAll(filepath.Join(def, "cache"), 0o700)
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			dst := filepath.Join(def, "cache", e.Name())
+			if _, err := os.Stat(dst); err == nil {
+				continue
+			}
+			_ = copyDir(filepath.Join(old, "cache", e.Name()), dst)
+		}
+	}
+
+	cfg.WorkDir = def
+	_ = cfg.save()
+	return old, true
+}
