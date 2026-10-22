@@ -1,0 +1,885 @@
+//go:build windows
+
+package main
+
+// 图形界面：录制 / 回放两个 Tab，所有操作在一个 exe 内完成。
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/lxn/walk"
+	. "github.com/lxn/walk/declarative"
+	"github.com/lxn/win"
+)
+
+type accountModel struct {
+	walk.TableModelBase
+	rows []accountRow
+	cfg  *appConfig
+}
+
+// StyleCell 给“状态”列上色：正常绿、封禁红、黑屋橙、过期灰、其他蓝。
+func (m *accountModel) StyleCell(style *walk.CellStyle) {
+	if style.Col() != 0 || m.cfg == nil {
+		return
+	}
+	row := style.Row()
+	if row < 0 || row >= len(m.rows) {
+		return
+	}
+	if m.rows[row].Remote {
+		style.BackgroundColor = walk.RGB(120, 120, 120)
+		style.TextColor = walk.RGB(255, 255, 255)
+		return
+	}
+	switch m.cfg.mark(m.rows[row].Card) {
+	case markBan:
+		style.BackgroundColor = walk.RGB(198, 40, 40)
+		style.TextColor = walk.RGB(255, 255, 255)
+	case markBlack:
+		style.BackgroundColor = walk.RGB(239, 108, 0)
+		style.TextColor = walk.RGB(255, 255, 255)
+	case markExpired:
+		style.BackgroundColor = walk.RGB(97, 97, 97)
+		style.TextColor = walk.RGB(255, 255, 255)
+	case markOther:
+		style.BackgroundColor = walk.RGB(21, 101, 192)
+		style.TextColor = walk.RGB(255, 255, 255)
+	default:
+		style.BackgroundColor = walk.RGB(46, 125, 50)
+		style.TextColor = walk.RGB(255, 255, 255)
+	}
+}
+
+func (m *accountModel) RowCount() int { return len(m.rows) }
+
+func (m *accountModel) Value(row, col int) interface{} {
+	if row < 0 || row >= len(m.rows) {
+		return ""
+	}
+	r := m.rows[row]
+	switch col {
+	case 0:
+		if r.Remote {
+			return "云端"
+		}
+		if m.cfg != nil {
+			return markLabel(m.cfg.mark(r.Card))
+		}
+		return "正常"
+	case 1:
+		return r.Card
+	case 2:
+		return r.QQ
+	case 3:
+		return r.OpenID
+	case 4:
+		return r.Note
+	case 5:
+		return r.Zone
+	case 6:
+		return r.Recorded.Format("01-02 15:04")
+	case 7:
+		return r.RawNote
+	default:
+		return ""
+	}
+}
+
+func (m *accountModel) SetValue(row, col int, value interface{}) error { return nil }
+
+type guiApp struct {
+	mw              *walk.MainWindow
+	tv              *walk.TableView
+	model           *accountModel
+	logBox          *walk.TextEdit
+	btnRecord       *walk.PushButton
+	btnReplay       *walk.PushButton
+	btnChoose       *walk.PushButton
+	headLabel       *walk.Label
+	btnRefresh      *walk.PushButton
+	btnMark         *walk.PushButton
+	btnCloudRefresh *walk.PushButton
+
+	dir      string
+	cacheDir string
+	logPath  string
+	listen   string
+	loader   string
+
+	cfg      *appConfig
+	profile  *loaderProfile
+	firstRun bool
+
+	host       *HostDatManager
+	srvMu      sync.Mutex
+	srv        *Server
+	busy       bool
+	runLog     *runLogger
+	logErr     error
+	closing    atomic.Bool
+	loadGen    int64
+	uiLogLines int
+	selectTop  atomic.Bool
+	cloudIdx   *cloudIndex // 只在界面线程读写
+}
+
+func runGUI() (err error) {
+	runtime.LockOSThread()
+	trace := openStartupTrace()
+	defer trace.close()
+	defer func() {
+		if r := recover(); r != nil {
+			trace.printf("panic: %v", r)
+			walk.MsgBox(nil, "CG 启动失败", fmt.Sprintf("%v", r), walk.MsgBoxIconError)
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	trace.printf("启动 CG v%s", toolVersion)
+
+	cfg := loadAppConfig()
+	firstRun := false
+	if cfg == nil || cfg.WorkDir == "" || findProfile(cfg.Profile) == nil {
+		trace.printf("需要首次配置")
+		sr, act := runSetupDialog(nil, cfg)
+		trace.printf("配置窗口返回: act=%d result=%+v", act, sr)
+		if act != setupOK {
+			trace.printf("用户没有完成配置，退出")
+			return nil
+		}
+		if cfg == nil {
+			cfg = &appConfig{}
+		}
+		cfg.Profile = sr.ProfileID
+		cfg.WorkDir = sr.WorkDir
+		cfg.CloudName = sr.CloudName
+		cfg.AutoCloud = true
+		if e := cfg.save(); e != nil {
+			walk.MsgBox(nil, "提示", "配置无法保存，下次启动会重新询问：\n"+e.Error(), walk.MsgBoxIconWarning)
+		}
+		firstRun = true
+	}
+
+	trace.printf("工作目录=%s 类型=%s 卡密=%s", cfg.WorkDir, cfg.Profile, cfg.CloudName)
+	a := &guiApp{cfg: cfg, firstRun: firstRun}
+	if e := a.init(); e != nil {
+		trace.printf("init 失败: %v", e)
+		walk.MsgBox(nil, "CG 启动失败", e.Error(), walk.MsgBoxIconError)
+		return e
+	}
+	trace.printf("主窗口创建完成，进入消息循环")
+	a.mw.Run()
+	trace.printf("主窗口已退出")
+	return nil
+}
+
+func (a *guiApp) init() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exeDir := filepath.Dir(exePath)
+	a.logPath = filepath.Join(exeDir, "run.log")
+
+	if a.cfg == nil {
+		a.cfg = &appConfig{Profile: "yuanmeng", WorkDir: exeDir, AutoCloud: true}
+	}
+	a.cfg.AutoCloud = true // 录制完成即自动上云，界面暂不提供开关
+	a.profile = findProfile(a.cfg.Profile)
+	if a.profile != nil {
+		a.cfg.Profile = a.profile.ID
+	}
+	a.dir = a.cfg.WorkDir
+	if a.dir == "" {
+		a.dir = exeDir
+	}
+	a.cacheDir = filepath.Join(a.dir, "cache")
+	a.listen = "127.0.0.1:18800"
+	a.host = NewHostDatManager(filepath.Join(a.dir, "host.dat"))
+	if a.profile != nil {
+		if p, e := a.profile.ensure(a.dir, false); e != nil {
+			a.logErr = e
+		} else {
+			a.loader = p
+		}
+	}
+	a.model = &accountModel{rows: nil, cfg: a.cfg}
+
+	if rl, e := openRunLogger(a.logPath); e == nil {
+		a.runLog = rl
+	} else {
+		a.logErr = e
+	}
+
+	if err := a.createWindow(); err != nil {
+		return err
+	}
+	if a.headLabel != nil {
+		a.headLabel.SetText(fmt.Sprintf("%s  ·  %s", a.profileName(), a.dir))
+	}
+	a.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
+		// 先标记关闭，后续后台协程的界面调用直接丢弃，避免关闭过程中再弹窗/改控件
+		a.closing.Store(true)
+		a.stopServerFast()
+		if cur, err := DecryptHostDat(a.host.Path); err == nil && cur == "http://"+a.listen {
+			_ = a.host.Restore()
+		}
+		a.runLog.line("程序退出")
+		a.runLog.close()
+	})
+	a.reloadAccounts()
+	a.refreshHostState()
+	a.logf("工作目录: %s", a.dir)
+	a.logf("缓存目录: %s", a.cacheDir)
+	if a.loader != "" {
+		a.logf("上号器: %s", a.loader)
+	} else {
+		a.logf("上号器还没解压成功，请在“录制模式”里点“切换上号器”重试")
+	}
+	if a.runLog != nil {
+		a.runLog.block("启动 CG v"+toolVersion,
+			fmt.Sprintf("工作目录: %s\r\n缓存目录: %s\r\n上号器: %s\r\n", a.dir, a.cacheDir, a.loader))
+		a.logf("运行日志: %s", a.logPath)
+	} else {
+		a.logf("警告: 无法写入 run.log: %v", a.logErr)
+	}
+	a.logf("自动云备份: CG/%s/%s.zip", a.cfg.cloudNameOrDefault(), a.profileID())
+	if a.firstRun {
+		a.logf("首次配置完成，拉取云端账号列表…")
+	}
+	a.refreshCloudList(false)
+	if a.logBox != nil {
+		a.logBox.SetTextColor(walk.RGB(0, 110, 60))
+	}
+	a.logf("使用步骤: 录制并上号 -> 选中账号 -> 用选中账号上号")
+
+	return nil
+}
+
+func (a *guiApp) createWindow() error {
+	return MainWindow{
+		AssignTo: &a.mw,
+		Title:    "CG",
+		Size:     Size{Width: 1320, Height: 760},
+		Layout:   VBox{},
+		Children: []Widget{
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					Label{AssignTo: &a.headLabel, Text: "CG", Font: Font{PointSize: 13, Bold: true}},
+					HSpacer{},
+				},
+			},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					PushButton{AssignTo: &a.btnRecord, Text: "录制并上号", MinSize: Size{Width: 190, Height: 38}, OnClicked: a.startRecord},
+					PushButton{AssignTo: &a.btnReplay, Text: "用选中账号上号", MinSize: Size{Width: 190, Height: 38}, OnClicked: a.startReplay},
+					PushButton{AssignTo: &a.btnMark, Text: "标记状态", OnClicked: a.markSelected},
+					PushButton{AssignTo: &a.btnRefresh, Text: "刷新列表", OnClicked: a.reloadAccounts},
+					PushButton{AssignTo: &a.btnCloudRefresh, Text: "刷新云端", OnClicked: func() { a.refreshCloudList(true) }},
+					HSpacer{},
+					PushButton{AssignTo: &a.btnChoose, Text: "切换上号器", OnClicked: a.reconfigure},
+				},
+			},
+			TableView{
+				AssignTo:            &a.tv,
+				AlternatingRowBG:    true,
+				LastColumnStretched: true,
+				Columns: []TableViewColumn{
+					{Title: "状态", Width: 70},
+					{Title: "卡密", Width: 160},
+					{Title: "QQ", Width: 110},
+					{Title: "openid / uid", Width: 210},
+					{Title: "备注", Width: 130},
+					{Title: "区服", Width: 110},
+					{Title: "录制时间", Width: 120},
+					{Title: "原始备注 (note)", Width: 320},
+				},
+				Model: a.model,
+			},
+			GroupBox{
+				Title:  "运行日志",
+				Layout: VBox{},
+				Children: []Widget{
+					TextEdit{AssignTo: &a.logBox, ReadOnly: true, VScroll: true, MinSize: Size{Height: 160}},
+				},
+			},
+		},
+	}.Create()
+}
+
+// ui 把函数排到界面线程执行，并投递一条空消息唤醒消息循环
+// （walk 的 Synchronize 只入队，空闲时不会主动执行）。
+func (a *guiApp) ui(f func()) {
+	if a.mw == nil || a.closing.Load() {
+		return
+	}
+	a.mw.Synchronize(f)
+	win.PostMessage(a.mw.Handle(), win.WM_NULL, 0, 0)
+}
+
+// 界面日志区最多保留的行数，超出后清屏，避免长时间运行越用越卡（完整内容在 run.log）。
+const maxLogViewLines = 600
+
+func (a *guiApp) logf(format string, args ...any) {
+	a.runLog.line(format, args...)
+	line := time.Now().Format("15:04:05") + "  " + fmt.Sprintf(format, args...) + "\r\n"
+	a.ui(func() {
+		if a.uiLogLines >= maxLogViewLines {
+			_ = a.logBox.SetText("(显示区已清空，完整内容见 run.log)\r\n")
+			a.uiLogLines = 0
+		}
+		a.logBox.AppendText(line)
+		a.uiLogLines++
+	})
+}
+
+// onPayload 把每次 redeem 的原始响应解密后写进 run.log（等价 CLI 的 dump）。
+func (a *guiApp) onPayload(action, card, endpoint string, body []byte) {
+	dumpPayload(a.runLog, action, card, endpoint, body)
+}
+
+func (a *guiApp) msg(title, text string) {
+	a.ui(func() {
+		walk.MsgBox(a.mw, title, text, walk.MsgBoxIconWarning)
+	})
+}
+
+func (a *guiApp) upstream() string {
+	if u, err := a.host.Upstream(a.listen); err == nil {
+		return u
+	}
+	return ""
+}
+
+func (a *guiApp) refreshHostState() {
+	cur, err := DecryptHostDat(a.host.Path)
+	if err != nil {
+		a.logf("host.dat 读取失败: %v", err)
+		return
+	}
+	if cur == "http://"+a.listen {
+		a.logf("host.dat 当前指向本地服务（上次异常退出残留），下次启动会自动还原")
+		return
+	}
+	if up := a.upstream(); up != "" {
+		a.logf("host.dat 正常，上游 %s", up)
+	}
+}
+
+// reloadAccounts 在后台线程读盘并解密缓存，再回界面线程刷新表格，避免界面卡住。
+// 用代数号丢弃过期的刷新结果，防止连点“刷新”时旧结果覆盖新结果。
+func (a *guiApp) reloadAccounts() {
+	gen := atomic.AddInt64(&a.loadGen, 1)
+	go func() {
+		local := loadAccountRows(NewCache(a.cacheDir))
+		a.ui(func() {
+			if atomic.LoadInt64(&a.loadGen) != gen {
+				return
+			}
+			rows := mergeRows(local, a.cloudIdx)
+			a.model.rows = rows
+			a.model.PublishRowsReset()
+			// 录完自动选中最新一行（列表本来就按录制时间倒序，最新在最上面）
+			if a.selectTop.CompareAndSwap(true, false) && len(rows) > 0 {
+				a.tv.SetCurrentIndex(0)
+			}
+		})
+	}()
+}
+
+// mergeRows 本地优先，云端独有的补在后面并标成“云端”。
+func mergeRows(local []accountRow, idx *cloudIndex) []accountRow {
+	if idx == nil {
+		return local
+	}
+	seen := make(map[string]bool, len(local))
+	rows := make([]accountRow, 0, len(local)+len(idx.Cards))
+	for _, r := range local {
+		seen[r.Card] = true
+		if e := idx.find(r.Card); e != nil {
+			if r.QQ == "-" && e.QQ != "" {
+				r.QQ = e.QQ
+			}
+			if r.OpenID == "-" && e.OpenID != "" {
+				r.OpenID = e.OpenID
+			}
+			if r.Zone == "-" && e.Zone != "" {
+				r.Zone = e.Zone
+			}
+		}
+		rows = append(rows, r)
+	}
+	for _, e := range idx.Cards {
+		if seen[e.Card] {
+			continue
+		}
+		rows = append(rows, entryToRow(e))
+	}
+	sortAccountRows(rows)
+	return rows
+}
+
+func (a *guiApp) reloadAccountsAsync() { a.reloadAccounts() }
+
+func (a *guiApp) setBusy(b bool) {
+	a.busy = b
+	a.btnRecord.SetEnabled(!b)
+	a.btnReplay.SetEnabled(!b)
+	a.btnChoose.SetEnabled(!b)
+	a.btnRefresh.SetEnabled(!b)
+	a.btnMark.SetEnabled(!b)
+	a.btnCloudRefresh.SetEnabled(!b)
+}
+
+func (a *guiApp) setBusyAsync(b bool) {
+	a.ui(func() { a.setBusy(b) })
+}
+
+// stopServer 优雅停止（在后台协程里调用，不阻塞界面）。
+func (a *guiApp) stopServer() {
+	srv := a.takeServer()
+	if srv == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+}
+
+// stopServerFast 关闭窗口时用，立即断开，避免等待连接导致界面卡住。
+func (a *guiApp) stopServerFast() {
+	srv := a.takeServer()
+	if srv == nil {
+		return
+	}
+	_ = srv.Close()
+}
+
+func (a *guiApp) takeServer() *Server {
+	a.srvMu.Lock()
+	srv := a.srv
+	a.srv = nil
+	a.srvMu.Unlock()
+	return srv
+}
+
+// reconfigure 重新选择上号器类型与缓存目录。
+func (a *guiApp) reconfigure() {
+	if a.busy {
+		return
+	}
+
+	// 收起第二界面，先把旧目录整个清掉，再回到第一界面重新配置
+	a.mw.SetVisible(false)
+	a.logf("切换上号器：卸载旧目录 %s", a.dir)
+	killed, err := removeDirForce(a.dir)
+	if len(killed) > 0 {
+		a.logf("已结束占用进程: %s", strings.Join(killed, "、"))
+	}
+	if err != nil {
+		a.logf("卸载旧目录失败: %v", err)
+		a.msg("卸载失败", err.Error()+"\n\n请手动关闭占用该目录的程序后重试。")
+	} else {
+		a.logf("已删除旧目录: %s", a.dir)
+	}
+	// 配置也一并清掉：下次启动需要重新填写
+	if err := os.Remove(configFilePath()); err != nil && !os.IsNotExist(err) {
+		a.logf("清除本地配置失败: %v", err)
+	} else {
+		a.logf("已清除本地配置（%s），下次启动需重新填写", configFilePath())
+	}
+
+	// 旧数据已经不存在了，列表和云端索引一并清空
+	a.cloudIdx = nil
+	a.model.rows = nil
+	a.model.PublishRowsReset()
+
+	sr, act := runSetupDialog(nil, a.cfg)
+	if act != setupOK {
+		// “退出”= 退出软件（此时已经没有第二界面可回）
+		a.logf("用户选择退出，关闭程序")
+		_ = a.mw.Close()
+		return
+	}
+
+	a.cfg.Profile = sr.ProfileID
+	a.cfg.WorkDir = sr.WorkDir
+	a.cfg.CloudName = sr.CloudName
+	if e := a.cfg.save(); e != nil {
+		a.logf("保存配置失败: %v", e)
+	}
+	a.applyConfig()
+	a.mw.SetVisible(true)
+}
+
+// applyConfig 按当前配置切换工作目录、解压上号器、刷新界面。
+func (a *guiApp) applyConfig() {
+	a.cfg.AutoCloud = true // 录制完成即自动上云，界面暂不提供开关
+	a.profile = findProfile(a.cfg.Profile)
+	a.dir = a.cfg.WorkDir
+	a.cacheDir = filepath.Join(a.dir, "cache")
+	a.host = NewHostDatManager(filepath.Join(a.dir, "host.dat"))
+	if a.profile != nil {
+		if p, err := a.profile.ensure(a.dir, false); err != nil {
+			a.logf("解压上号器失败: %v", err)
+		} else {
+			a.loader = p
+		}
+	}
+	a.logf("工作目录切换为: %s（%s）", a.dir, a.profileName())
+	a.headLabel.SetText(fmt.Sprintf("%s  ·  %s", a.profileName(), a.dir))
+	a.refreshHostState()
+	a.reloadAccounts()
+	a.refreshCloudList(false)
+}
+
+func (a *guiApp) profileName() string {
+	if a.profile == nil {
+		return "未知"
+	}
+	return a.profile.Name
+}
+
+func (a *guiApp) startRecord() {
+	if a.busy {
+		return
+	}
+	a.launch(true, "")
+}
+
+func (a *guiApp) startReplay() {
+	if a.busy {
+		return
+	}
+	idx := a.tv.CurrentIndex()
+	if idx < 0 || idx >= len(a.model.rows) {
+		walk.MsgBox(a.mw, "提示", "请先在列表中选择一个账号。", walk.MsgBoxIconInformation)
+		return
+	}
+	row := a.model.rows[idx]
+	if !hasLocalCard(a.cacheDir, row.Card) {
+		a.downloadThenReplay(row.Card)
+		return
+	}
+	a.launch(false, row.Card)
+}
+
+// downloadThenReplay 本地没有该账号时，先从云端拉这一份再上号。
+func (a *guiApp) downloadThenReplay(card string) {
+	if a.busy {
+		return
+	}
+	name, pid := a.cfg.cloudNameOrDefault(), a.profileID()
+	cacheDir := a.cacheDir
+	a.setBusy(true)
+	a.logf("本地没有 %s 的缓存，开始按需下载…", card)
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				a.logf("按需下载异常: %v", r)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+
+		files, size, err := downloadCardCloud(ctx, name, pid, cacheDir, card)
+		if err != nil {
+			a.setBusyAsync(false)
+			a.logf("按需下载失败: %v", err)
+			a.msg("下载失败", "无法从云端获取该账号缓存:\n"+err.Error())
+			return
+		}
+		a.logf("已下载 %s: %d 个文件 / %.1f KB", card, files, float64(size)/1024)
+		a.setBusyAsync(false)
+		a.reloadAccounts()
+		a.launch(false, card)
+	}()
+}
+
+func (a *guiApp) launch(record bool, card string) {
+	if a.loader == "" {
+		walk.MsgBox(a.mw, "提示", "上号器还没解压出来。\n请在“录制模式”里点“切换上号器”选择类型和目录。", walk.MsgBoxIconInformation)
+		return
+	}
+	up := a.upstream()
+	if up == "" {
+		walk.MsgBox(a.mw, "错误", "无法从 host.dat 读取服务器地址，请检查文件是否完整。", walk.MsgBoxIconError)
+		return
+	}
+	if !record && card == "" {
+		return
+	}
+
+	all := true        // 永远全量录制，保证离线可回放
+	offline := !record // 回放永远走本地缓存
+	modeName := "录制"
+	if !record {
+		modeName = "回放"
+	}
+	a.setBusy(true)
+	a.logf("---- 开始%s：%s ----", modeName, card)
+
+	loader := a.loader
+	workDir, cacheDir, hostMgr := a.dir, a.cacheDir, a.host
+	go func() {
+		// 兜底：任何意外都在这里收住，避免整个界面闪退
+		defer func() {
+			if r := recover(); r != nil {
+				a.logf("内部异常: %v", r)
+				a.msg("内部异常", fmt.Sprintf("%v", r))
+			}
+		}()
+		defer a.setBusyAsync(false)
+		defer a.reloadAccountsAsync()
+
+		a.stopServer()
+		if !record {
+			if _, changed, err := writeReplayConfig(workDir); err != nil {
+				a.logf("写入 config.ini 失败: %v", err)
+			} else if changed {
+				a.logf("已重写 config.ini（card=%s, dir=请选择游戏目录, ssn=346, auto_zone=0）", placeholderCard)
+			} else {
+				a.logf("config.ini 已是占位卡密，保留现有内容（含已选好的游戏目录）")
+			}
+		}
+
+		// 录制先写独立目录，结束后再按卡密合并，避免边录边清导致多个号互相覆盖
+		serverCache := cacheDir
+		staging := ""
+		if record {
+			staging = filepath.Join(workDir, stagingDirName)
+			if hasContent(staging) {
+				if m, _, err := mergeRecording(staging, cacheDir); err == nil && m > 0 {
+					a.logf("发现上次未合并的录制，已并入缓存: %d 个账号", m)
+				}
+			}
+			_ = os.RemoveAll(staging)
+			if err := os.MkdirAll(staging, 0o700); err != nil {
+				a.logf("创建录制目录失败: %v", err)
+				a.msg("录制失败", "无法创建录制目录:\n"+err.Error())
+				return
+			}
+			serverCache = staging
+			a.logf("本次录制写入临时目录: %s", staging)
+		}
+		opts := Options{
+			Listen:    a.listen,
+			Upstream:  up,
+			CacheDir:  serverCache,
+			All:       all,
+			Offline:   offline,
+			Refresh:   record,
+			Pin:       card,
+			Log:       a.logf,
+			OnPayload: a.onPayload,
+		}
+		srv := NewServer(opts)
+		ln, err := net.Listen("tcp", a.listen)
+		if err != nil {
+			a.logf("端口 %s 被占用: %v", a.listen, err)
+			a.msg("启动失败", "本地端口 "+a.listen+" 被占用。\n请先关闭其他上号器或缓存服务。")
+			return
+		}
+		go func() {
+			if err := srv.Serve(ln); err != nil {
+				a.logf("服务异常: %v", err)
+			}
+		}()
+		a.srvMu.Lock()
+		a.srv = srv
+		a.srvMu.Unlock()
+
+		orig, changed, err := hostMgr.Patch(a.listen)
+		if err != nil {
+			a.logf("改写 host.dat 失败: %v", err)
+			a.msg("启动失败", "改写 host.dat 失败:\n"+err.Error())
+			return
+		}
+		if changed {
+			a.logf("host.dat: %s -> http://%s", orig, a.listen)
+			defer func() {
+				if err := hostMgr.Restore(); err != nil {
+					a.logf("还原 host.dat 失败: %v", err)
+				} else {
+					a.logf("host.dat 已还原")
+				}
+			}()
+		}
+
+		a.logf("启动上号器: %s", loader)
+		cmd := exec.Command(loader)
+		cmd.Dir = workDir
+		if err := cmd.Start(); err != nil {
+			if isElevationRequired(err) {
+				a.logf("上号器需要管理员权限")
+				a.msg("需要管理员权限", "上号器要求管理员权限。\n请退出后右键本程序，选择“以管理员身份运行”。")
+			} else {
+				a.logf("启动失败: %v", err)
+				a.msg("启动失败", err.Error())
+			}
+			return
+		}
+		_ = cmd.Wait()
+		a.logf("上号器已退出")
+
+		if record && staging != "" {
+			cards := stagedCards(staging)
+			merged, skipped, err := mergeRecording(staging, cacheDir)
+			switch {
+			case err != nil:
+				a.logf("合并录制失败: %v（数据保留在 %s）", err, staging)
+				a.msg("合并失败", "录制数据已保留在:\n"+staging+"\n\n错误: "+err.Error())
+			default:
+				if merged > 0 {
+					a.selectTop.Store(true)
+					a.logf("已合并 %d 个账号到缓存，最新录制排在最前", merged)
+				} else {
+					a.logf("本次没有录制到完整账号（缺少 redeem 数据）")
+				}
+				if len(skipped) > 0 {
+					a.logf("跳过未完成的录制: %s", strings.Join(skipped, ", "))
+				}
+				_ = os.RemoveAll(staging)
+
+				if len(cards) > 0 && a.cfg != nil {
+					a.uploadRecordedCards(cards)
+				}
+			}
+			a.reloadAccounts()
+		}
+	}()
+}
+
+// ---------- 云缓存 ----------
+
+func (a *guiApp) profileID() string {
+	if a.profile != nil && a.profile.ID != "" {
+		return a.profile.ID
+	}
+	return "1"
+}
+
+// markSelected 给选中账号打标记（封禁 / 黑屋 / 过期 / 其他 / 正常）。
+func (a *guiApp) markSelected() {
+	if a.busy {
+		return
+	}
+	idx := a.tv.CurrentIndex()
+	if idx < 0 || idx >= len(a.model.rows) {
+		walk.MsgBox(a.mw, "提示", "请先在列表中选择一个账号。", walk.MsgBoxIconInformation)
+		return
+	}
+	row := a.model.rows[idx]
+	status, ok := runMarkDialog(a.mw, row, a.cfg.mark(row.Card))
+	if !ok {
+		return
+	}
+	a.cfg.setMark(row.Card, status)
+	if err := a.cfg.save(); err != nil {
+		a.logf("保存标记失败: %v", err)
+	}
+	a.logf("标记 %s (%s) -> %s", row.Card, row.QQ, markLabel(status))
+	a.model.PublishRowsReset()
+
+	name, pid := a.cfg.cloudNameOrDefault(), a.profileID()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := updateCloudMark(ctx, name, pid, row.Card, status); err != nil {
+			a.logf("云端标记同步失败: %v", err)
+			return
+		}
+		a.logf("云端标记已同步: %s -> %s", row.Card, markLabel(status))
+	}()
+}
+
+// refreshCloudList 拉取云端 index.json 并合并进列表（本地优先）。
+func (a *guiApp) refreshCloudList(manual bool) {
+	if a.cfg == nil {
+		return
+	}
+	name, pid := a.cfg.cloudNameOrDefault(), a.profileID()
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				a.logf("刷新云端异常: %v", r)
+			}
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		idx, err := fetchCloudIndex(ctx, name, pid)
+		if err != nil {
+			a.logf("拉取云端列表失败: %v", err)
+			if manual {
+				a.msg("刷新云端失败", err.Error())
+			}
+			return
+		}
+		a.ui(func() { a.applyCloudIndex(idx) })
+	}()
+}
+
+// applyCloudIndex 记住云端索引，同步标记，然后重新合并表格。
+func (a *guiApp) applyCloudIndex(idx *cloudIndex) {
+	marked := 0
+	for _, e := range idx.Cards {
+		if e.Mark != "" {
+			a.cfg.setMark(e.Card, e.Mark)
+			marked++
+		}
+	}
+	a.cloudIdx = idx
+	if marked > 0 {
+		if err := a.cfg.save(); err != nil {
+			a.logf("保存标记失败: %v", err)
+		}
+	}
+	a.reloadAccounts()
+	a.logf("云端列表: %d 个账号", len(idx.Cards))
+}
+
+// uploadRecordedCards 录制完成后按账号上传，并合并更新云端索引。
+func (a *guiApp) uploadRecordedCards(cards []string) {
+	name, pid := a.cfg.cloudNameOrDefault(), a.profileID()
+	cacheDir := a.cacheDir
+	rows := loadAccountRows(NewCache(cacheDir))
+	byCard := make(map[string]accountRow, len(rows))
+	for _, r := range rows {
+		byCard[r.Card] = r
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	a.logf("自动云备份 -> %s/（%d 个账号）", cloudBaseDir(name, pid), len(cards))
+	for _, card := range cards {
+		entry := cloudCardEntry{Card: card, Mark: a.cfg.mark(card)}
+		if r, ok := byCard[card]; ok {
+			entry.QQ = cleanField(r.QQ)
+			entry.OpenID = cleanField(r.OpenID)
+			entry.Zone = cleanField(r.Zone)
+			entry.Note = cleanField(r.Note)
+			entry.RawNote = cleanField(r.RawNote)
+			if !r.Recorded.IsZero() {
+				entry.Recorded = r.Recorded.Format("2006-01-02 15:04:05")
+			}
+		}
+		if err := uploadCardCloud(ctx, name, pid, cacheDir, card, entry); err != nil {
+			a.logf("云备份失败 %s: %v", card, err)
+			continue
+		}
+		a.logf("云备份完成 %s", card)
+	}
+}
