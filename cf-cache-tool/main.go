@@ -15,8 +15,6 @@ import (
 	"time"
 )
 
-const toolVersion = "1.3.0"
-
 func usage() {
 	fmt.Print(`CG - CF 上号器卡密数据本地缓存工具
 

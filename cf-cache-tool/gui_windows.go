@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/lxn/walk"
@@ -147,6 +149,8 @@ func runGUI() (err error) {
 	}()
 	trace.printf("启动 CG v%s", toolVersion)
 
+	cleanupOldExe()
+
 	cfg := loadAppConfig()
 	firstRun := false
 	if cfg == nil || cfg.WorkDir == "" || findProfile(cfg.Profile) == nil {
@@ -262,6 +266,9 @@ func (a *guiApp) init() error {
 		a.logBox.SetTextColor(walk.RGB(0, 110, 60))
 	}
 	a.logf("使用步骤: 录制并上号 -> 选中账号 -> 用选中账号上号")
+
+	// 后台检查云端更新（不阻塞界面，失败只写日志）
+	go a.checkUpdate()
 
 	return nil
 }
@@ -882,4 +889,74 @@ func (a *guiApp) uploadRecordedCards(cards []string) {
 		}
 		a.logf("云备份完成 %s", card)
 	}
+}
+
+// checkUpdate 后台检查云端更新，发现新版本就下载、校验并替换当前 exe。
+// 全流程只在后台跑，失败只写日志，不影响界面。
+func (a *guiApp) checkUpdate() {
+	defer func() {
+		if r := recover(); r != nil {
+			a.logf("检查更新异常: %v", r)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	m, err := fetchUpdateManifest(ctx)
+	if err != nil {
+		if errors.Is(err, errCloudNotFound) {
+			return // 云端还没发布过版本
+		}
+		a.logf("检查更新失败: %v", err)
+		return
+	}
+	if !versionNewer(m.Version, toolVersion) {
+		a.logf("版本 v%s 已是最新", toolVersion)
+		return
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		a.logf("更新失败: %v", err)
+		return
+	}
+	a.logf("发现新版本 v%s，开始下载…", m.Version)
+	tmp, err := downloadUpdate(ctx, exe, m)
+	if err != nil {
+		a.logf("更新下载失败: %v", err)
+		return
+	}
+	if err := applyUpdate(exe, tmp); err != nil {
+		_ = os.Remove(tmp)
+		a.logf("更新替换失败: %v", err)
+		return
+	}
+	// 正在录制/回放、或者还停在首配窗口时，不打断用户
+	if a.busy || a.firstRun || a.closing.Load() {
+		a.logf("已更新到 v%s，下次启动生效", m.Version)
+		a.ui(func() {
+			if a.headLabel != nil {
+				a.headLabel.SetText(fmt.Sprintf("%s  ·  %s  ·  已更新 v%s", a.profileName(), a.dir, m.Version))
+			}
+		})
+		return
+	}
+
+	a.logf("已更新到 v%s，2 秒后自动重启", m.Version)
+	restartApp(exe)
+	time.Sleep(300 * time.Millisecond)
+	// 走正常关闭流程：还原 host.dat、写完 run.log，然后由后台命令拉起新版本
+	a.ui(func() { _ = a.mw.Close() })
+}
+
+// restartApp 用一个分离的 cmd 延迟拉起新版本，避免和正在退出的旧进程抢 host.dat。
+func restartApp(exe string) {
+	// 用 ping 做延时（不依赖控制台），然后拉起新版本
+	cmd := exec.Command("cmd", "/c", fmt.Sprintf(`ping -n 3 127.0.0.1 >nul & start "" "%s"`, exe))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	go func() { _ = cmd.Wait() }()
 }
