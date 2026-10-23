@@ -1,0 +1,26 @@
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 构建产物（dist 下只保留说明文档）
+dist/*.exe
+dist/*.exe.bak
+dist/*.bak
+dist/*.dll
+dist/ntop_v17_dll/
+*.syso.tmp
+
+# 运行时日志
+*.log
+
+# 逆向 / 抓包 / 临时测试产出
+dump/
+dump.zip
+cf-clone/
+tools/
+work/
+
+# 通用备份与测试构建
+*.bak
+*.test
