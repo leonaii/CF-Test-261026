@@ -52,6 +52,9 @@ type verifyStatus struct {
 	Message   string
 	ElapsedMS int64
 
+	CK     string // 完整 Cookie（uin/skey/p_skey）
+	Cookie string
+
 	Raw string
 	Err string
 	At  time.Time
@@ -90,7 +93,11 @@ func queryVerifyStatus(host, code string) verifyStatus {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", verifyUserAgent)
 
-	resp, err := verifyHTTPClient.Do(req)
+	client := verifyHTTPClient
+	if p := proxyHTTPClient(); p != nil {
+		client = p
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		st.Err = "连接失败"
 		return st
@@ -132,6 +139,8 @@ func queryVerifyStatus(host, code string) verifyStatus {
 	st.Zhanqu = verifyText(parsed, "zhanqu")
 	st.Message = verifyText(parsed, "message")
 	st.ElapsedMS = verifyInt(parsed, "elapsed_ms")
+	st.CK = verifyText(parsed, "ck")
+	st.Cookie = verifyText(parsed, "cookie")
 	return st
 }
 

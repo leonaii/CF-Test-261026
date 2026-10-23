@@ -22,7 +22,7 @@ type loaderProfile struct {
 var loaderProfiles = []loaderProfile{
 	{
 		ID:       "1",
-		Name:     "圆梦科级上号器",
+		Name:     "圆梦上号器",
 		ExeName:  "CF上号器_v1.17.exe",
 		SiteName: "圆梦卡网",
 		Site:     "https://www.517fk.cn/links/8B1B512A",

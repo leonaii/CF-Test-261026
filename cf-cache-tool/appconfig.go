@@ -44,6 +44,7 @@ type appConfig struct {
 	WorkDir   string            `json:"work_dir"`
 	CloudName string            `json:"cloud_name"`
 	AutoCloud bool              `json:"auto_cloud"`
+	ProxyOn   *bool             `json:"proxy_on,omitempty"` // nil = 默认开启
 	Marks     map[string]string `json:"marks,omitempty"`
 }
 
@@ -103,6 +104,22 @@ func (c *appConfig) setMark(card, status string) {
 		return
 	}
 	c.Marks[card] = status
+}
+
+// proxyDefault 代理开关默认值：没配置过就默认开启（直连 IP 容易被验号接口限频/封）。
+func (c *appConfig) proxyDefault() bool {
+	if c == nil || c.ProxyOn == nil {
+		return true
+	}
+	return *c.ProxyOn
+}
+
+func (c *appConfig) setProxy(on bool) {
+	if c == nil {
+		return
+	}
+	v := on
+	c.ProxyOn = &v
 }
 
 // cloudNameOrDefault 自动备份/恢复使用的名称：优先用户填的，否则用上号器类型 ID。
