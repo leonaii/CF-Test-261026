@@ -33,6 +33,12 @@ type accountRow struct {
 	Recorded time.Time
 	Decoded  bool
 	Remote   bool // true = 只在云端，本地还没下载
+
+	// 验号接口（/api/query/status）的异步结果，仅内存展示，不落盘
+	Verify    string
+	VerifyRaw string
+	VerifyErr string
+	VerifyAt  time.Time
 }
 
 func anyStr(v any) string {

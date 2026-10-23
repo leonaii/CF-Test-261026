@@ -27,6 +27,7 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 	var combo *walk.ComboBox
 	var nameEdit *walk.LineEdit
 	var siteEdit *walk.LineEdit
+	var noteLabel *walk.Label
 	var statusLabel *walk.Label
 
 	var (
@@ -53,6 +54,7 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 
 	site := profileByIndex(defIdx).Site
 	siteName := profileByIndex(defIdx).SiteName
+	siteNote := profileByIndex(defIdx).SiteNote
 
 	gray := walk.RGB(140, 140, 140)
 	dim := walk.RGB(110, 110, 110)
@@ -60,7 +62,7 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 	d := Dialog{
 		AssignTo: &dlg,
 		Title:    "CG",
-		Size:     Size{Width: 620, Height: 430},
+		Size:     Size{Width: 620, Height: 470},
 		Layout:   VBox{},
 		Children: []Widget{
 			Label{Text: "CG", Font: Font{PointSize: 24, Bold: true}},
@@ -94,6 +96,7 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 							HSpacer{},
 						},
 					},
+					Label{AssignTo: &noteLabel, Text: "购买说明：" + siteNote, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
 				},
 			},
 
@@ -142,7 +145,11 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 		}
 		site = p.Site
 		siteName = p.SiteName
+		siteNote = p.SiteNote
 		siteEdit.SetText(p.Site)
+		if noteLabel != nil {
+			noteLabel.SetText("购买说明：" + p.SiteNote)
+		}
 	})
 	_ = siteName
 
@@ -254,3 +261,45 @@ func runMarkDialog(owner walk.Form, row accountRow, current string) (string, boo
 	}
 	return chosen, true
 }
+
+// runRawNoteDialog 查看/复制完整的原始备注。
+func runRawNoteDialog(owner walk.Form, row accountRow) {
+	var dlg *walk.Dialog
+	var edit *walk.TextEdit
+
+	text := row.RawNote
+	if text == "" || text == "-" {
+		text = "（这个账号没有原始备注）"
+	} else {
+		text = prettyJSON(text)
+	}
+
+	d := Dialog{
+		AssignTo: &dlg,
+		Title:    "原始备注",
+		Size:     Size{Width: 720, Height: 520},
+		Layout:   VBox{},
+		Children: []Widget{
+			Label{Text: "卡密 " + row.Card + "    QQ " + row.QQ, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+			TextEdit{AssignTo: &edit, Text: text, ReadOnly: true, VScroll: true, MinSize: Size{Width: 660, Height: 300}},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					Label{Text: "可以选中后 Ctrl+C，或点“复制全部”", TextColor: walk.RGB(150, 150, 150), Font: Font{PointSize: 8}},
+					HSpacer{},
+					PushButton{Text: "复制全部", MinSize: Size{Width: 100, Height: 34}, OnClicked: func() {
+						if err := copyToClipboard(edit.Text()); err != nil {
+							walk.MsgBox(dlg, "提示", "复制失败: "+err.Error(), walk.MsgBoxIconWarning)
+						}
+					}},
+					PushButton{Text: "关闭", MinSize: Size{Width: 96, Height: 34}, OnClicked: func() { dlg.Accept() }},
+				},
+			},
+		},
+	}
+	if err := d.Create(owner); err != nil {
+		return
+	}
+	dlg.Run()
+}
+

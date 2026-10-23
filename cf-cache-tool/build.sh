@@ -89,11 +89,13 @@ LOADER_ID="1"
 
 # 上号器本体与 host.dat 不打进 exe，构建时同步到云端（内容没变就跳过）
 sync_loader() {
-    local dir="assets/yuanmeng"
+    # 上号器资源目录：优先用环境变量 LOADER_ASSET_DIR，其次 ../资源/上号器/yuanmeng
+    local dir="${LOADER_ASSET_DIR:-../资源/上号器/yuanmeng}"
     local exe
     exe="$(ls "$dir"/*.exe 2>/dev/null | head -1)"
     if [ -z "$exe" ] || [ ! -f "$dir/host.dat" ]; then
         echo "==> [loader] 跳过：$dir 下没有 exe 或 host.dat"
+        echo "            可用 LOADER_ASSET_DIR=路径 ./build.sh 指定其它目录"
         return 0
     fi
 

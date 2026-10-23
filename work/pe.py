@@ -1,7 +1,7 @@
 import pefile
 import struct
 
-PE_PATH = "/Users/leonos/Downloads/cf/新1.17上号器/CF上号器_v1.17.exe"
+PE_PATH = "/Users/leonos/Downloads/cf/新1.17上号器/资源/上号器/yuanmeng/CF上号器_v1.17.exe"
 pe = pefile.PE(PE_PATH, fast_load=True)
 IMAGE_BASE = 0x140000000
 

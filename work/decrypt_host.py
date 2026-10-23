@@ -86,7 +86,7 @@ def decrypt_host(path: str) -> str:
 
     out = bytearray(plain)
     for i in range(len(out)):
-        out[i] ^= (xor_key[(i + 3) & 31] ^ (xor_key[i & 31] + i * 17)) & 0xFF
+        out[i] ^= (xor_key[(3 + 7 * i) & 31] ^ (xor_key[i & 31] + i * 17)) & 0xFF
     return nibble_swap(bytes(out)).decode("utf-8", "replace")
 
 

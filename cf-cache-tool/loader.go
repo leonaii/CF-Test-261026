@@ -16,6 +16,7 @@ type loaderProfile struct {
 	ExeName  string
 	SiteName string // 卡网名称
 	Site     string // 卡网链接
+	SiteNote string // 购买说明
 }
 
 var loaderProfiles = []loaderProfile{
@@ -25,6 +26,7 @@ var loaderProfiles = []loaderProfile{
 		ExeName:  "CF上号器_v1.17.exe",
 		SiteName: "圆梦卡网",
 		Site:     "https://www.517fk.cn/links/8B1B512A",
+		SiteNote: "0V-10V / 10V-19V / 20V-49V / 50-99V 这家的",
 	},
 }
 

@@ -23,6 +23,9 @@ import (
 	"github.com/lxn/win"
 )
 
+// 表格列索引：验证数据固定放在最后一列，前面各列沿用原顺序。
+const verifyColumn = 8
+
 type accountModel struct {
 	walk.TableModelBase
 	rows []accountRow
@@ -39,6 +42,14 @@ func (m *accountModel) StyleCell(style *walk.CellStyle) {
 		return
 	}
 	r := m.rows[row]
+
+	// 验号列：请求失败的显示红字，其余保持默认色，不受云端灰显影响
+	if style.Col() == verifyColumn {
+		if r.VerifyErr != "" {
+			style.TextColor = walk.RGB(183, 28, 28)
+		}
+		return
+	}
 
 	// 只在云端、还没下载到本地的行：其它列灰显，提示“点启动会自动下载”
 	if style.Col() != 0 {
@@ -94,6 +105,11 @@ func (m *accountModel) Value(row, col int) interface{} {
 		return r.Recorded.Format("01-02 15:04")
 	case 7:
 		return r.RawNote
+	case verifyColumn:
+		if r.Verify != "" {
+			return r.Verify
+		}
+		return "-"
 	default:
 		return ""
 	}
@@ -112,11 +128,12 @@ type guiApp struct {
 	headLabel       *walk.Label
 	headSub         *walk.Label
 	siteEdit        *walk.LineEdit
+	siteNote        *walk.Label
 	btnCopySite     *walk.PushButton
 	btnOpenSite     *walk.PushButton
 	verLabel        *walk.Label
-	btnRefresh      *walk.PushButton
 	btnMark         *walk.PushButton
+	btnVerify       *walk.PushButton
 	btnCloudRefresh *walk.PushButton
 
 	dir      string
@@ -141,6 +158,9 @@ type guiApp struct {
 	selectTop   atomic.Bool
 	cloudIdx    *cloudIndex // 只在界面线程读写
 	loaderReady atomic.Bool
+
+	verifying  atomic.Bool // 验证请求进行中
+	clickedCol int         // 最近一次点击的列，用于区分双击打开哪个详情
 }
 
 func runGUI() (err error) {
@@ -276,6 +296,17 @@ func (a *guiApp) init() error {
 	if err := a.createWindow(); err != nil {
 		return err
 	}
+	a.tv.ColumnClicked().Attach(func(col int) { a.clickedCol = col })
+	a.tv.ItemActivated().Attach(func() {
+		// 双击“验证数据”列看验号详情，其它列沿用原来的原始备注窗口
+		if a.clickedCol == verifyColumn {
+			a.showVerifyDetail()
+			return
+		}
+		a.showRawNote()
+	})
+	a.tv.CurrentIndexChanged().Attach(func() { a.updateSelectionState() })
+	a.updateSelectionState()
 	a.refreshHeader()
 	a.mw.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
 		// 先标记关闭，后续后台协程的界面调用直接丢弃，避免关闭过程中再弹窗/改控件
@@ -311,7 +342,7 @@ func (a *guiApp) init() error {
 	if a.logBox != nil {
 		a.logBox.SetTextColor(walk.RGB(0, 110, 60))
 	}
-	a.logf("使用步骤: 录制并上号 -> 选中账号 -> 用选中账号上号")
+	a.logf("使用步骤: 新增 -> 选中账号 -> 选中上号")
 
 	// 后台检查云端更新（不阻塞界面，失败只写日志）
 	go a.checkUpdate()
@@ -323,7 +354,7 @@ func (a *guiApp) createWindow() error {
 	return MainWindow{
 		AssignTo: &a.mw,
 		Title:    "CG",
-		Size:     Size{Width: 1320, Height: 760},
+		Size:     Size{Width: 1150, Height: 640},
 		Layout:   VBox{},
 		Children: []Widget{
 			Composite{
@@ -339,7 +370,7 @@ func (a *guiApp) createWindow() error {
 				Layout: HBox{Spacing: 8},
 				Children: []Widget{
 					Label{Text: "购买地址", TextColor: walk.RGB(110, 110, 110), Font: Font{PointSize: 9}},
-					LineEdit{AssignTo: &a.siteEdit, ReadOnly: true, MinSize: Size{Width: 430}},
+					LineEdit{AssignTo: &a.siteEdit, ReadOnly: true, MinSize: Size{Width: 380}},
 					PushButton{AssignTo: &a.btnCopySite, Text: "复制", MinSize: Size{Width: 64}, OnClicked: func() {
 						if err := copyToClipboard(a.siteEdit.Text()); err != nil {
 							a.logf("复制购买地址失败: %v", err)
@@ -353,15 +384,23 @@ func (a *guiApp) createWindow() error {
 					HSpacer{},
 				},
 			},
+			Composite{
+				Layout: HBox{Spacing: 8},
+				Children: []Widget{
+					Label{Text: "购买说明", TextColor: walk.RGB(110, 110, 110), Font: Font{PointSize: 9}},
+					Label{AssignTo: &a.siteNote, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+					HSpacer{},
+				},
+			},
 			VSeparator{},
 			Composite{
 				Layout: HBox{Spacing: 6},
 				Children: []Widget{
-					PushButton{AssignTo: &a.btnRecord, Text: "录制并上号", MinSize: Size{Width: 190, Height: 38}, OnClicked: a.startRecord},
-					PushButton{AssignTo: &a.btnReplay, Text: "用选中账号上号", MinSize: Size{Width: 190, Height: 38}, OnClicked: a.startReplay},
-					PushButton{AssignTo: &a.btnMark, Text: "标记状态", OnClicked: a.markSelected},
-					PushButton{AssignTo: &a.btnRefresh, Text: "刷新列表", OnClicked: a.reloadAccounts},
-					PushButton{AssignTo: &a.btnCloudRefresh, Text: "刷新云端", OnClicked: func() { a.refreshCloudList(true) }},
+					PushButton{AssignTo: &a.btnRecord, Text: "新增", MinSize: Size{Width: 96, Height: 34}, OnClicked: a.startRecord},
+					PushButton{AssignTo: &a.btnReplay, Text: "选中上号", MinSize: Size{Width: 96, Height: 34}, OnClicked: a.startReplay},
+					PushButton{AssignTo: &a.btnMark, Text: "标记", MinSize: Size{Width: 80, Height: 34}, OnClicked: a.markSelected},
+					PushButton{AssignTo: &a.btnVerify, Text: "验证", MinSize: Size{Width: 80, Height: 34}, OnClicked: a.verifySelected},
+					PushButton{AssignTo: &a.btnCloudRefresh, Text: "刷新", MinSize: Size{Width: 80, Height: 34}, OnClicked: func() { a.refreshCloudList(true) }},
 					HSpacer{},
 					PushButton{AssignTo: &a.btnChoose, Text: "切换上号器", OnClicked: a.reconfigure},
 				},
@@ -372,14 +411,15 @@ func (a *guiApp) createWindow() error {
 				CustomRowHeight:     26,
 				LastColumnStretched: true,
 				Columns: []TableViewColumn{
-					{Title: "状态", Width: 70},
-					{Title: "卡密", Width: 160},
-					{Title: "QQ", Width: 110},
-					{Title: "openid / uid", Width: 210},
-					{Title: "备注", Width: 130},
+					{Title: "状态", Width: 60},
+					{Title: "卡密", Width: 150},
+					{Title: "QQ", Width: 100},
+					{Title: "uid", Width: 110},
+					{Title: "备注", Width: 110},
 					{Title: "区服", Width: 110},
-					{Title: "录制时间", Width: 120},
-					{Title: "原始备注 (note)", Width: 320},
+					{Title: "录制时间", Width: 105},
+					{Title: "原始备注（双击查看）", Width: 320},
+					{Title: "验证数据（双击查看）", Width: 260},
 				},
 				Model: a.model,
 			},
@@ -463,13 +503,15 @@ func (a *guiApp) reloadAccounts() {
 			if atomic.LoadInt64(&a.loadGen) != gen {
 				return
 			}
-			rows := mergeRows(local, a.cloudIdx)
+			// 刷新列表时把已有的验号结果带过来，避免每刷一次就清空
+			rows := carryVerifyResults(a.model.rows, mergeRows(local, a.cloudIdx))
 			a.model.rows = rows
 			a.model.PublishRowsReset()
 			// 录完自动选中最新一行（列表本来就按录制时间倒序，最新在最上面）
 			if a.selectTop.CompareAndSwap(true, false) && len(rows) > 0 {
 				a.tv.SetCurrentIndex(0)
 			}
+			a.updateSelectionState()
 		})
 	}()
 }
@@ -511,11 +553,9 @@ func (a *guiApp) reloadAccountsAsync() { a.reloadAccounts() }
 func (a *guiApp) setBusy(b bool) {
 	a.busy = b
 	a.btnRecord.SetEnabled(!b)
-	a.btnReplay.SetEnabled(!b)
 	a.btnChoose.SetEnabled(!b)
-	a.btnRefresh.SetEnabled(!b)
-	a.btnMark.SetEnabled(!b)
 	a.btnCloudRefresh.SetEnabled(!b)
+	a.updateSelectionState()
 }
 
 func (a *guiApp) setBusyAsync(b bool) {
@@ -1058,9 +1098,7 @@ func (a *guiApp) updateLoaderButtons() {
 	if a.btnRecord != nil {
 		a.btnRecord.SetEnabled(ready && !a.busy)
 	}
-	if a.btnReplay != nil {
-		a.btnReplay.SetEnabled(ready && !a.busy)
-	}
+	a.updateSelectionState()
 }
 
 // syncLoaderAsync 后台从云端获取上号器与 host.dat。
@@ -1101,4 +1139,205 @@ func (a *guiApp) refreshHeader() {
 	if a.siteEdit != nil && a.profile != nil {
 		a.siteEdit.SetText(a.profile.Site)
 	}
+	if a.siteNote != nil && a.profile != nil {
+		a.siteNote.SetText(a.profile.SiteNote)
+	}
+}
+
+// showRawNote 弹出原始备注窗口，可自由选中复制。
+func (a *guiApp) showRawNote() {
+	idx := a.tv.CurrentIndex()
+	if idx < 0 || idx >= len(a.model.rows) {
+		walk.MsgBox(a.mw, "提示", "请先在列表中选择一个账号。", walk.MsgBoxIconInformation)
+		return
+	}
+	runRawNoteDialog(a.mw, a.model.rows[idx])
+}
+
+// updateSelectionState 没选中行时把“选中上号 / 标记”置灰，选中后恢复。
+func (a *guiApp) updateSelectionState() {
+	if a.tv == nil || a.model == nil {
+		return
+	}
+	idx := a.tv.CurrentIndex()
+	hasRow := idx >= 0 && idx < len(a.model.rows)
+
+	if a.btnReplay != nil {
+		a.btnReplay.SetEnabled(hasRow && !a.busy && a.loaderReady.Load())
+	}
+	if a.btnMark != nil {
+		a.btnMark.SetEnabled(hasRow && !a.busy)
+	}
+	if a.btnVerify != nil {
+		a.btnVerify.SetEnabled(hasRow && !a.busy && !a.verifying.Load())
+	}
+}
+
+// verifySelected 手动验证：只查当前选中的账号，不自动刷新、不并发。
+func (a *guiApp) verifySelected() {
+	idx := a.tv.CurrentIndex()
+	if idx < 0 || idx >= len(a.model.rows) {
+		walk.MsgBox(a.mw, "提示", "请先在列表中选择一个账号。", walk.MsgBoxIconInformation)
+		return
+	}
+	if a.busy || a.verifying.Load() {
+		return
+	}
+
+	row := a.model.rows[idx]
+	card := strings.TrimSpace(row.Card)
+	if card == "" || card == "-" {
+		walk.MsgBox(a.mw, "提示", "这一行没有卡密，无法验证。", walk.MsgBoxIconWarning)
+		return
+	}
+	host := strings.TrimSpace(a.upstream())
+	if host == "" {
+		walk.MsgBox(a.mw, "提示", "拿不到验证服务器地址，请检查 host.dat。", walk.MsgBoxIconWarning)
+		return
+	}
+
+	a.verifying.Store(true)
+	a.setVerifyBusy(true)
+	a.logf("验证 %s …", card)
+
+	go func() {
+		st := queryVerifyStatus(host, card)
+		a.ui(func() {
+			a.verifying.Store(false)
+			a.setVerifyBusy(false)
+			updated := a.storeVerifyResult(card, st)
+
+			// 失败：只弹提示，不展示 JSON
+			if st.Err != "" || st.RateLimited || !st.OK {
+				a.showVerifyError(st)
+				return
+			}
+			a.logf("验证 %s 完成：%s", card, verifySummary(st))
+			runVerifyDialog(a.mw, updated)
+		})
+	}()
+}
+
+// setVerifyBusy 请求进行中禁用按钮，防止连点造成并发。
+func (a *guiApp) setVerifyBusy(b bool) {
+	if a.btnVerify == nil {
+		return
+	}
+	if b {
+		a.btnVerify.SetText("验证中…")
+		a.btnVerify.SetEnabled(false)
+		return
+	}
+	a.btnVerify.SetText("验证")
+	a.updateSelectionState()
+}
+
+// storeVerifyResult 把结果写进对应行并刷新该行。
+func (a *guiApp) storeVerifyResult(card string, st verifyStatus) accountRow {
+	var updated accountRow
+	for i := range a.model.rows {
+		row := &a.model.rows[i]
+		if row.Card != card {
+			continue
+		}
+		row.Verify = verifySummary(st)
+		row.VerifyRaw = st.Raw
+		row.VerifyErr = st.Err
+		row.VerifyAt = st.At
+		a.model.PublishRowChanged(i)
+		updated = *row
+		break
+	}
+	return updated
+}
+
+// showVerifyError 失败弹框：限频时把需要等待的秒数说清楚。
+func (a *guiApp) showVerifyError(st verifyStatus) {
+	text := st.Err
+	if st.RateLimited {
+		wait := st.RetryAfter
+		if wait <= 0 {
+			wait = 8 * time.Second
+		}
+		text = fmt.Sprintf("查询过于频繁，请 %.0f 秒后再试。", wait.Seconds()+0.5)
+		if st.Message != "" {
+			text = st.Message
+		}
+	} else if text == "" {
+		text = st.Message
+	}
+	if text == "" {
+		text = "验证失败"
+	}
+	a.logf("验证失败：%s", text)
+	walk.MsgBox(a.mw, "验证失败", text, walk.MsgBoxIconWarning)
+}
+
+// carryVerifyResults 列表重建时按卡密把旧验号结果带过来。
+func carryVerifyResults(old, fresh []accountRow) []accountRow {
+	if len(old) == 0 || len(fresh) == 0 {
+		return fresh
+	}
+	saved := make(map[string]accountRow, len(old))
+	for _, r := range old {
+		if r.Verify != "" || r.VerifyRaw != "" || r.VerifyErr != "" {
+			saved[r.Card] = r
+		}
+	}
+	if len(saved) == 0 {
+		return fresh
+	}
+	for i := range fresh {
+		if o, ok := saved[fresh[i].Card]; ok {
+			fresh[i].Verify = o.Verify
+			fresh[i].VerifyRaw = o.VerifyRaw
+			fresh[i].VerifyErr = o.VerifyErr
+			fresh[i].VerifyAt = o.VerifyAt
+		}
+	}
+	return fresh
+}
+
+// showVerifyDetail 双击“验证数据”列时打开详情。
+func (a *guiApp) showVerifyDetail() {
+	idx := a.tv.CurrentIndex()
+	if idx < 0 || idx >= len(a.model.rows) {
+		walk.MsgBox(a.mw, "提示", "请先在列表中选择一个账号。", walk.MsgBoxIconInformation)
+		return
+	}
+	runVerifyDialog(a.mw, a.model.rows[idx])
+}
+
+// runVerifyDialog 查看验号结果与原始响应，交互与原始备注窗口一致。
+func runVerifyDialog(owner walk.Form, row accountRow) {
+	var dlg *walk.Dialog
+	var edit *walk.TextEdit
+
+	d := Dialog{
+		AssignTo: &dlg,
+		Title:    "验证数据",
+		Size:     Size{Width: 720, Height: 520},
+		Layout:   VBox{},
+		Children: []Widget{
+			Label{Text: "卡密 " + row.Card + "    QQ " + row.QQ, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+			TextEdit{AssignTo: &edit, Text: verifyDetailText(row), ReadOnly: true, VScroll: true, MinSize: Size{Width: 660, Height: 300}},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					Label{Text: "可以选中后 Ctrl+C，或点“复制全部”", TextColor: walk.RGB(150, 150, 150), Font: Font{PointSize: 8}},
+					HSpacer{},
+					PushButton{Text: "复制全部", MinSize: Size{Width: 100, Height: 34}, OnClicked: func() {
+						if err := copyToClipboard(edit.Text()); err != nil {
+							walk.MsgBox(dlg, "提示", "复制失败: "+err.Error(), walk.MsgBoxIconWarning)
+						}
+					}},
+					PushButton{Text: "关闭", MinSize: Size{Width: 96, Height: 34}, OnClicked: func() { dlg.Accept() }},
+				},
+			},
+		},
+	}
+	if err := d.Create(owner); err != nil {
+		return
+	}
+	dlg.Run()
 }
