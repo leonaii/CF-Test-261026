@@ -26,9 +26,35 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 	var dlg *walk.Dialog
 	var combo *walk.ComboBox
 	var nameEdit *walk.LineEdit
-	var siteEdit *walk.LineEdit
-	var noteLabel *walk.Label
 	var statusLabel *walk.Label
+	var startBtn *walk.PushButton
+
+	// applyUpdateLock 按更新状态锁/解锁输入：「正在更新」时不能输入也不能启动，
+	// 新版本替换完成后只能点重启，重启进新进程才恢复。
+	applyUpdateLock := func() {
+		if nameEdit == nil || startBtn == nil {
+			return
+		}
+		if appliedVersion() != "" {
+			nameEdit.SetEnabled(false)
+			startBtn.SetEnabled(true)
+			startBtn.SetText("重启到新版本")
+			if statusLabel != nil {
+				statusLabel.SetText("新版本已就绪，点「重启到新版本」生效")
+			}
+			return
+		}
+		if updateBusy.Load() {
+			nameEdit.SetEnabled(false)
+			startBtn.SetEnabled(false)
+			startBtn.SetText("正在更新…")
+			return
+		}
+		// 没在更新（含下载失败）：恢复正常输入
+		nameEdit.SetEnabled(true)
+		startBtn.SetEnabled(true)
+		startBtn.SetText("开始使用")
+	}
 
 	var (
 		accepted bool
@@ -52,53 +78,24 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 		defName = cfg.CloudName
 	}
 
-	site := profileByIndex(defIdx).Site
-	siteName := profileByIndex(defIdx).SiteName
-	siteNote := profileByIndex(defIdx).SiteNote
-
 	gray := walk.RGB(140, 140, 140)
 	dim := walk.RGB(110, 110, 110)
 
 	d := Dialog{
 		AssignTo: &dlg,
 		Title:    "CG",
-		Size:     Size{Width: 620, Height: 470},
+		Size:     Size{Width: 560, Height: 330},
 		Layout:   VBox{},
 		Children: []Widget{
-			Label{Text: "CG", Font: Font{PointSize: 24, Bold: true}},
-			Label{Text: "上号器集成工具", TextColor: gray, Font: Font{PointSize: 9}},
+			Label{Text: "CG租号", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 24, Bold: true}},
 			VSpacer{Size: 10},
 
 			Label{Text: "上号器类型", TextColor: dim, Font: Font{PointSize: 9}},
 			ComboBox{AssignTo: &combo, Model: names, MinSize: Size{Width: 320}},
 
 			VSpacer{Size: 6},
-			Label{Text: "卡密", TextColor: dim, Font: Font{PointSize: 9}},
+			Label{Text: "卡密 / 名称", TextColor: dim, Font: Font{PointSize: 9}},
 			LineEdit{AssignTo: &nameEdit, Text: defName},
-
-			VSpacer{Size: 12},
-			GroupBox{
-				Title:  "购买地址",
-				Layout: VBox{},
-				Children: []Widget{
-					LineEdit{AssignTo: &siteEdit, ReadOnly: true, Text: site},
-					Composite{
-						Layout: HBox{},
-						Children: []Widget{
-							PushButton{Text: "复制链接", MinSize: Size{Width: 96}, OnClicked: func() {
-								if err := copyToClipboard(site); err != nil {
-									walk.MsgBox(dlg, "提示", "复制失败，请手动选中链接复制。", walk.MsgBoxIconWarning)
-								}
-							}},
-							PushButton{Text: "打开卡网", MinSize: Size{Width: 96}, OnClicked: func() {
-								openBrowser(site)
-							}},
-							HSpacer{},
-						},
-					},
-					Label{AssignTo: &noteLabel, Text: "购买说明：" + siteNote, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
-				},
-			},
 
 			VSpacer{},
 			Label{AssignTo: &statusLabel, Text: "", TextColor: gray, Font: Font{PointSize: 8}},
@@ -107,7 +104,20 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 				Children: []Widget{
 					Label{Text: "v" + toolVersion, TextColor: gray, Font: Font{PointSize: 8}},
 					HSpacer{},
-					PushButton{Text: "开始使用", MinSize: Size{Width: 132, Height: 38}, OnClicked: func() {
+					PushButton{AssignTo: &startBtn, Text: "开始使用", MinSize: Size{Width: 132, Height: 38}, OnClicked: func() {
+						// 已经替换好新版本：直接重启进新版本
+						if appliedVersion() != "" {
+							if exe, e := os.Executable(); e == nil {
+								pendingRestart.Store(exe)
+								dlg.Cancel()
+								return
+							}
+						}
+						if updateBusy.Load() {
+							walk.MsgBox(dlg, "提示", "正在更新到新版本，请稍候…", walk.MsgBoxIconInformation)
+							return
+						}
+
 						name, err := normalizeBackupName(nameEdit.Text())
 						if err != nil {
 							walk.MsgBox(dlg, "卡密不合法", err.Error(), walk.MsgBoxIconWarning)
@@ -136,22 +146,7 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 		return nil, setupQuit
 	}
 	_ = combo.SetCurrentIndex(defIdx)
-
-	// 切换类型时同步购买地址
-	combo.CurrentIndexChanged().Attach(func() {
-		p := profileByIndex(combo.CurrentIndex())
-		if p == nil {
-			return
-		}
-		site = p.Site
-		siteName = p.SiteName
-		siteNote = p.SiteNote
-		siteEdit.SetText(p.Site)
-		if noteLabel != nil {
-			noteLabel.SetText("购买说明：" + p.SiteNote)
-		}
-	})
-	_ = siteName
+	applyUpdateLock() // 窗口打开时可能已经在下载更新了
 
 	// 监听更新进度，实时显示在窗口里
 	var dialogClosed atomic.Bool
@@ -168,9 +163,13 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 				func() {
 					defer func() { _ = recover() }()
 					dlg.Synchronize(func() {
-						if !dialogClosed.Load() && statusLabel != nil {
+						if dialogClosed.Load() {
+							return
+						}
+						if statusLabel != nil {
 							statusLabel.SetText(msg)
 						}
+						applyUpdateLock()
 					})
 				}()
 			case <-time.After(300 * time.Millisecond):
@@ -302,4 +301,3 @@ func runRawNoteDialog(owner walk.Form, row accountRow) {
 	}
 	dlg.Run()
 }
-

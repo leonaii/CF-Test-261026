@@ -24,7 +24,10 @@ import (
 )
 
 // 表格列索引：验证数据固定放在最后一列，前面各列沿用原顺序。
-const verifyColumn = 8
+const (
+	verifyColumn = 8
+	selfColumn   = 9
+)
 
 type accountModel struct {
 	walk.TableModelBase
@@ -42,6 +45,19 @@ func (m *accountModel) StyleCell(style *walk.CellStyle) {
 		return
 	}
 	r := m.rows[row]
+
+	// 自研上号列：进行中蓝、成功绿、失败红
+	if style.Col() == selfColumn {
+		switch r.SelfState {
+		case "进行中":
+			style.TextColor = walk.RGB(21, 101, 192)
+		case "成功":
+			style.TextColor = walk.RGB(46, 125, 50)
+		case "失败":
+			style.TextColor = walk.RGB(198, 40, 40)
+		}
+		return
+	}
 
 	// 验号列：请求失败的显示红字，其余保持默认色，不受云端灰显影响
 	if style.Col() == verifyColumn {
@@ -105,6 +121,11 @@ func (m *accountModel) Value(row, col int) interface{} {
 		return r.Recorded.Format("01-02 15:04")
 	case 7:
 		return r.RawNote
+	case selfColumn:
+		if r.SelfState == "" {
+			return "-"
+		}
+		return r.SelfState
 	case verifyColumn:
 		if r.Verify != "" {
 			return r.Verify
@@ -127,10 +148,6 @@ type guiApp struct {
 	btnChoose       *walk.PushButton
 	headLabel       *walk.Label
 	headSub         *walk.Label
-	siteEdit        *walk.LineEdit
-	siteNote        *walk.Label
-	btnCopySite     *walk.PushButton
-	btnOpenSite     *walk.PushButton
 	verLabel        *walk.Label
 	btnMark         *walk.PushButton
 	btnVerify       *walk.PushButton
@@ -159,8 +176,20 @@ type guiApp struct {
 	cloudIdx    *cloudIndex // 只在界面线程读写
 	loaderReady atomic.Bool
 
+	ymm  ymmPageState
+	slim bool // 非 leonai 卡密：精简模式，只显示「在线」页
+
+	spinLabel *walk.Label
+	spinCount int32
+
 	verifying  atomic.Bool // 验证请求进行中
 	clickedCol int         // 最近一次点击的列，用于区分双击打开哪个详情
+
+	// 自研上号（单页一键）
+	btnSelfOp   *walk.PushButton
+	selfBusy    atomic.Bool
+	selfChecked bool
+	selfTk      *selfTicket
 }
 
 func runGUI() (err error) {
@@ -209,8 +238,14 @@ func runGUI() (err error) {
 		trace.printf("安装目录已迁移: %s -> %s", old, cfg.WorkDir)
 	}
 
+	// CF 卡密每次都要停在第一屏确认，不进第二屏
+	needSetup := cfg == nil || cfg.WorkDir == "" || cfg.CloudName == "" || findProfile(cfg.Profile) == nil
+	if !needSetup && looksLikeCard(cfg.CloudName) {
+		needSetup = true
+	}
+
 	firstRun := false
-	if cfg == nil || cfg.WorkDir == "" || findProfile(cfg.Profile) == nil {
+	if needSetup {
 		trace.printf("需要首次配置")
 		sr, act := runSetupDialog(nil, cfg)
 		trace.printf("配置窗口返回: act=%d result=%+v", act, sr)
@@ -218,6 +253,13 @@ func runGUI() (err error) {
 			trace.printf("用户没有完成配置，退出")
 			return nil
 		}
+		// 先校验卡密授权，不通过就不落配置，下次启动重新询问
+		if err := checkCardLicense(sr.CloudName); err != nil {
+			trace.printf("卡密校验失败: %v", err)
+			walk.MsgBox(nil, "卡密未授权", err.Error()+"\n\n请重新输入卡密。", walk.MsgBoxIconError)
+			return nil
+		}
+
 		if cfg == nil {
 			cfg = &appConfig{}
 		}
@@ -241,6 +283,29 @@ func runGUI() (err error) {
 	}
 
 	trace.printf("工作目录=%s 类型=%s 卡密=%s", cfg.WorkDir, cfg.Profile, cfg.CloudName)
+
+	// 已有配置同样要过白名单：名单里没有就清掉卡密，下次启动重新输入
+	if !firstRun {
+		if err := checkCardLicense(cfg.CloudName); err != nil {
+			trace.printf("卡密校验失败: %v", err)
+			cfg.CloudName = ""
+			_ = cfg.save()
+			walk.MsgBox(nil, "卡密未授权", err.Error()+"\n\n下次启动请重新输入卡密。", walk.MsgBoxIconError)
+			return nil
+		}
+	}
+
+	// 首屏填的是 CF 卡密：不进主界面，直接走离线上号
+	if card := strings.TrimSpace(cfg.CloudName); looksLikeCard(card) {
+		trace.printf("卡密直登: %s", card)
+
+		if err := runDirectLaunch(cfg, card); err != nil {
+			trace.printf("直登上号失败: %v", err)
+			walk.MsgBox(nil, "上号失败", err.Error()+"\n\n下次启动会直接进入列表界面，可手动选号上号。", walk.MsgBoxIconError)
+		}
+		return nil
+	}
+
 	a := &guiApp{cfg: cfg, firstRun: firstRun}
 	if e := a.init(); e != nil {
 		trace.printf("init 失败: %v", e)
@@ -275,6 +340,8 @@ func (a *guiApp) init() error {
 	}
 	a.cacheDir = filepath.Join(a.dir, "cache")
 	a.listen = "127.0.0.1:18800"
+	// 代理 IP 落盘缓存：下次启动 180s 内直接复用，省一次取 IP 往返
+	ymmProxy.setCachePath(filepath.Join(a.dir, "proxy.json"))
 	a.host = NewHostDatManager(filepath.Join(a.dir, "host.dat"))
 	if a.profile != nil {
 		a.loader = filepath.Join(a.dir, a.profile.ExeName)
@@ -287,7 +354,14 @@ func (a *guiApp) init() error {
 	}
 	a.model = &accountModel{rows: nil, cfg: a.cfg}
 
-	if rl, e := openRunLogger(a.logPath); e == nil {
+	// 只有管理员本人（卡密 leonai）看到完整界面；其他卡密进精简模式
+	a.slim = !strings.EqualFold(strings.TrimSpace(a.cfg.CloudName), "leonai")
+
+	// 只有管理员本人（leonai）落 run.log；其他卡密不写日志，并清掉可能残留的旧文件
+	if a.slim {
+		_ = os.Remove(a.logPath)
+		a.runLog = nil
+	} else if rl, e := openRunLogger(a.logPath); e == nil {
 		a.runLog = rl
 	} else {
 		a.logErr = e
@@ -331,7 +405,7 @@ func (a *guiApp) init() error {
 		a.runLog.block("启动 CG v"+toolVersion,
 			fmt.Sprintf("工作目录: %s\r\n缓存目录: %s\r\n上号器: %s\r\n", a.dir, a.cacheDir, a.loader))
 		a.logf("运行日志: %s", a.logPath)
-	} else {
+	} else if !a.slim {
 		a.logf("警告: 无法写入 run.log: %v", a.logErr)
 	}
 	a.logf("自动云备份: CG/%s/%s.zip", a.cfg.cloudNameOrDefault(), a.profileID())
@@ -351,45 +425,19 @@ func (a *guiApp) init() error {
 }
 
 func (a *guiApp) createWindow() error {
-	return MainWindow{
-		AssignTo: &a.mw,
-		Title:    "CG",
-		Size:     Size{Width: 1150, Height: 640},
-		Layout:   VBox{},
-		Children: []Widget{
+	winSize := Size{Width: 1150, Height: 640}
+	if a.slim {
+		winSize = Size{Width: 980, Height: 560}
+	}
+
+	recChildren := []Widget{
 			Composite{
 				Layout: HBox{Spacing: 10},
 				Children: []Widget{
-					Label{AssignTo: &a.headLabel, Text: "CG", Font: Font{PointSize: 18, Bold: true}},
+					Label{AssignTo: &a.headLabel, Text: "CG租号", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 18, Bold: true}},
 					Label{AssignTo: &a.headSub, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
 					HSpacer{},
 					Label{AssignTo: &a.verLabel, Text: "v" + toolVersion, TextColor: walk.RGB(150, 150, 150), Font: Font{PointSize: 8}},
-				},
-			},
-			Composite{
-				Layout: HBox{Spacing: 8},
-				Children: []Widget{
-					Label{Text: "购买地址", TextColor: walk.RGB(110, 110, 110), Font: Font{PointSize: 9}},
-					LineEdit{AssignTo: &a.siteEdit, ReadOnly: true, MinSize: Size{Width: 380}},
-					PushButton{AssignTo: &a.btnCopySite, Text: "复制", MinSize: Size{Width: 64}, OnClicked: func() {
-						if err := copyToClipboard(a.siteEdit.Text()); err != nil {
-							a.logf("复制购买地址失败: %v", err)
-						} else {
-							a.logf("购买地址已复制")
-						}
-					}},
-					PushButton{AssignTo: &a.btnOpenSite, Text: "打开", MinSize: Size{Width: 64}, OnClicked: func() {
-						openBrowser(a.siteEdit.Text())
-					}},
-					HSpacer{},
-				},
-			},
-			Composite{
-				Layout: HBox{Spacing: 8},
-				Children: []Widget{
-					Label{Text: "购买说明", TextColor: walk.RGB(110, 110, 110), Font: Font{PointSize: 9}},
-					Label{AssignTo: &a.siteNote, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
-					HSpacer{},
 				},
 			},
 			VSeparator{},
@@ -400,6 +448,7 @@ func (a *guiApp) createWindow() error {
 					PushButton{AssignTo: &a.btnReplay, Text: "选中上号", MinSize: Size{Width: 96, Height: 34}, OnClicked: a.startReplay},
 					PushButton{AssignTo: &a.btnMark, Text: "标记", MinSize: Size{Width: 80, Height: 34}, OnClicked: a.markSelected},
 					PushButton{AssignTo: &a.btnVerify, Text: "验证", MinSize: Size{Width: 80, Height: 34}, OnClicked: a.verifySelected},
+					PushButton{AssignTo: &a.btnSelfOp, Text: "自研上号", MinSize: Size{Width: 108, Height: 34}, Enabled: false, OnClicked: a.onSelfOpClick},
 					PushButton{AssignTo: &a.btnCloudRefresh, Text: "刷新", MinSize: Size{Width: 80, Height: 34}, OnClicked: func() { a.refreshCloudList(true) }},
 					HSpacer{},
 					PushButton{AssignTo: &a.btnChoose, Text: "切换上号器", OnClicked: a.reconfigure},
@@ -420,6 +469,7 @@ func (a *guiApp) createWindow() error {
 					{Title: "录制时间", Width: 105},
 					{Title: "原始备注（双击查看）", Width: 320},
 					{Title: "验证数据（双击查看）", Width: 260},
+					{Title: "自研上号", Width: 100},
 				},
 				Model: a.model,
 			},
@@ -430,8 +480,50 @@ func (a *guiApp) createWindow() error {
 					TextEdit{AssignTo: &a.logBox, ReadOnly: true, VScroll: true, MinSize: Size{Height: 160}},
 				},
 			},
-		},
-	}.Create()
+	}
+
+	// 精简模式：不建 TabWidget，只放「在线」页；录制页控件仍创建但隐藏
+	// （a.tv / a.logBox 等被其它逻辑引用，不能为 nil）
+	var body Widget
+	if a.slim {
+		body = Composite{
+			Layout: VBox{},
+			Children: []Widget{
+				Composite{Visible: false, Layout: VBox{}, Children: recChildren},
+				Composite{Layout: VBox{}, Children: []Widget{a.ymmPage()}},
+			},
+		}
+	} else {
+		body = TabWidget{
+			Pages: []TabPage{
+				{Title: "录制 / 回放", Layout: VBox{}, Children: recChildren},
+				{Title: "yuanmeng", Layout: VBox{}, Children: []Widget{a.ymmPage()}},
+			},
+		}
+	}
+
+	if err := (MainWindow{
+		AssignTo: &a.mw,
+		Title:    "CG租号",
+		Size:     winSize,
+		Layout:   VBox{},
+		Children: []Widget{body},
+	}).Create(); err != nil {
+		return err
+	}
+	a.tv.CurrentIndexChanged().Attach(func() { a.updateSelfOpButton() })
+	a.updateSelfOpButton()
+	a.ymm.app = a
+	// 时间列点击排序
+	if a.ymm.tv != nil {
+		a.ymm.tv.ColumnClicked().Attach(func(col int) { a.ymm.onColumnClick(col) })
+	}
+	// 恢复代理开关（默认开启：直连 IP 容易被验号接口限频）
+	if a.cfg != nil && a.cfg.proxyDefault() && a.ymm.chkProxy != nil {
+		a.ymm.chkProxy.SetChecked(true)
+	}
+	a.ymm.refresh()
+	return nil
 }
 
 // ui 把函数排到界面线程执行，并投递一条空消息唤醒消息循环
@@ -440,8 +532,48 @@ func (a *guiApp) ui(f func()) {
 	if a.mw == nil || a.closing.Load() {
 		return
 	}
-	a.mw.Synchronize(f)
+	a.mw.Synchronize(func() {
+		// 后台回调里出异常不能把整个界面带崩
+		defer func() { _ = recover() }()
+		f()
+	})
 	win.PostMessage(a.mw.Handle(), win.WM_NULL, 0, 0)
+}
+
+// spinFrames 是右上角的“转圈”帧，Braille 点阵看起来像连续旋转。
+var spinFrames = []string{"⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"}
+
+// spinBegin 标记一次接口请求开始，多个请求并发时只转一个圈。
+func (a *guiApp) spinBegin() {
+	if atomic.AddInt32(&a.spinCount, 1) != 1 {
+		return
+	}
+	go a.spinLoop()
+}
+
+// spinEnd 标记一次请求结束。
+func (a *guiApp) spinEnd() {
+	if atomic.LoadInt32(&a.spinCount) > 0 {
+		atomic.AddInt32(&a.spinCount, -1)
+	}
+}
+
+// spinLoop 在后台按 90ms 换帧，只在有请求时运行。
+func (a *guiApp) spinLoop() {
+	for i := 0; atomic.LoadInt32(&a.spinCount) > 0; i++ {
+		frame := spinFrames[i%len(spinFrames)]
+		a.ui(func() {
+			if a.spinLabel != nil {
+				a.spinLabel.SetText(frame)
+			}
+		})
+		time.Sleep(90 * time.Millisecond)
+	}
+	a.ui(func() {
+		if a.spinLabel != nil {
+			a.spinLabel.SetText("")
+		}
+	})
 }
 
 // 界面日志区最多保留的行数，超出后清屏，避免长时间运行越用越卡（完整内容在 run.log）。
@@ -629,6 +761,13 @@ func (a *guiApp) reconfigure() {
 		return
 	}
 
+	if err := checkCardLicense(sr.CloudName); err != nil {
+		a.logf("卡密校验失败: %v", err)
+		walk.MsgBox(a.mw, "卡密未授权", err.Error()+"\n\n保留原来的卡密。", walk.MsgBoxIconError)
+		a.mw.SetVisible(true)
+		return
+	}
+
 	a.cfg.Profile = sr.ProfileID
 	a.cfg.WorkDir = sr.WorkDir
 	a.cfg.CloudName = sr.CloudName
@@ -647,6 +786,9 @@ func (a *guiApp) applyConfig() {
 	a.cacheDir = filepath.Join(a.dir, "cache")
 	a.host = NewHostDatManager(filepath.Join(a.dir, "host.dat"))
 	a.loaderReady.Store(false)
+	if a.ymm.api == nil {
+		a.ymm.api = newCardClient()
+	}
 	if a.profile != nil {
 		a.loader = filepath.Join(a.dir, a.profile.ExeName)
 		if ok, reason := localLoaderReady(a.dir, a.profile); ok {
@@ -1135,12 +1277,6 @@ func (a *guiApp) syncLoaderAsync() {
 func (a *guiApp) refreshHeader() {
 	if a.headSub != nil {
 		a.headSub.SetText("  " + a.profileName())
-	}
-	if a.siteEdit != nil && a.profile != nil {
-		a.siteEdit.SetText(a.profile.Site)
-	}
-	if a.siteNote != nil && a.profile != nil {
-		a.siteNote.SetText(a.profile.SiteNote)
 	}
 }
 

@@ -32,6 +32,8 @@ var pendingRestart atomic.Value // string
 var (
 	updateMu      sync.Mutex
 	updateApplied atomic.Value // string
+	// updateBusy 为 true 表示正在下载/替换，首屏此时要锁住输入，避免用旧版本启动
+	updateBusy atomic.Bool
 )
 
 const (
@@ -265,13 +267,16 @@ func checkUpdateCore(logf func(string, ...any)) (string, error) {
 		return "", err
 	}
 	logf("发现新版本 v%s，开始下载…", m.Version)
+	updateBusy.Store(true)
 
 	tmp, err := downloadUpdate(ctx, exe, m)
 	if err != nil {
+		updateBusy.Store(false)
 		return "", err
 	}
 	if err := applyUpdate(exe, tmp); err != nil {
 		_ = os.Remove(tmp)
+		updateBusy.Store(false)
 		return "", err
 	}
 	updateApplied.Store(m.Version)
