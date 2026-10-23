@@ -39,6 +39,10 @@ type accountRow struct {
 	VerifyRaw string
 	VerifyErr string
 	VerifyAt  time.Time
+
+	// 自研上号状态，仅内存
+	SelfState string // ""=未开始 / 进行中 / 成功 / 失败
+	SelfErr   string
 }
 
 func anyStr(v any) string {
