@@ -69,6 +69,7 @@ GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
     -ldflags "${LDFLAGS}" -o "${DIST}/CG-cli.exe" .
 
 echo "==> 校验内嵌资源"
+if command -v python3 >/dev/null 2>&1 && python3 -V >/dev/null 2>&1; then
 python3 - "$DIST/CG.exe" "$NEW" <<'PY'
 import sys
 path, ver = sys.argv[1], sys.argv[2]
@@ -82,6 +83,9 @@ for name, needle in checks.items():
     print(f"    {name}: {'OK' if needle in data else '缺失'}")
 print(f"    大小: {len(data)/1024/1024:.1f} MB")
 PY
+else
+    echo "    跳过（本机 python3 不可用）"
+fi
 
 BASE="https://cloud.51i.cc/remote.php/dav/files/leonai"
 AUTH="leonai:QGdWe-otHHx-35wCj-MtCKM-owZkK"
