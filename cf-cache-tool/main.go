@@ -52,6 +52,11 @@ func logf(format string, args ...any) {
 
 func main() {
 	if len(os.Args) < 2 {
+		// 单实例：已经开了一个就不再开第二个
+		if !ensureSingleInstance() {
+			warnAlreadyRunning()
+			return
+		}
 		// 无参数：Windows 下打开图形界面，其他平台给出提示
 		if err := runGUI(); err != nil {
 			fmt.Fprintln(os.Stderr, "错误:", err)
