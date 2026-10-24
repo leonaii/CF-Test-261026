@@ -514,10 +514,13 @@ func (a *guiApp) createWindow() error {
 	a.tv.CurrentIndexChanged().Attach(func() { a.updateSelfOpButton() })
 	a.updateSelfOpButton()
 	a.ymm.app = a
+	a.ymm.source = a.cfg.dataSource()
+	a.ymm.updateSourceBtn()
 	// 时间列点击排序
 	if a.ymm.tv != nil {
 		a.ymm.tv.ColumnClicked().Attach(func(col int) { a.ymm.onColumnClick(col) })
 	}
+
 	// 恢复代理开关（默认开启：直连 IP 容易被验号接口限频）
 	if a.cfg != nil && a.cfg.proxyDefault() && a.ymm.chkProxy != nil {
 		a.ymm.chkProxy.SetChecked(true)
@@ -765,6 +768,22 @@ func (a *guiApp) reconfigure() {
 		a.logf("卡密校验失败: %v", err)
 		walk.MsgBox(a.mw, "卡密未授权", err.Error()+"\n\n保留原来的卡密。", walk.MsgBoxIconError)
 		a.mw.SetVisible(true)
+		return
+	}
+
+	// 换成 CF 卡密：不该停在第二屏。存好配置后重启，新进程会回到第一屏
+	if looksLikeCard(sr.CloudName) {
+		a.cfg.Profile = sr.ProfileID
+		a.cfg.WorkDir = sr.WorkDir
+		a.cfg.CloudName = sr.CloudName
+		if e := a.cfg.save(); e != nil {
+			a.logf("保存配置失败: %v", e)
+		}
+		a.logf("卡密切换为 %s，重启回到第一屏", sr.CloudName)
+		if exe, e := os.Executable(); e == nil {
+			pendingRestart.Store(exe)
+		}
+		a.ui(func() { _ = a.mw.Close() })
 		return
 	}
 

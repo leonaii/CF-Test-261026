@@ -31,9 +31,10 @@ func (a *guiApp) ymmPage() Widget {
 	a.ymm.sortAsc = false
 
 	ops := []Widget{
-		PushButton{Text: "①查封", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmQuerySelected},
+		PushButton{AssignTo: &a.ymm.btnVerify, Text: "①查封", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmQuerySelected},
 		PushButton{Text: "②上号", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmLaunchViaLauncherClick},
 		PushButton{Text: "复制卡密", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmCopyCard},
+		PushButton{AssignTo: &a.ymm.btnSource, Text: "数据源：在线", MinSize: Size{Width: 110, Height: btnH}, OnClicked: func() { a.ymm.toggleSource() }},
 		CheckBox{
 			AssignTo: &a.ymm.chkProxy,
 			Text:     "使用代理",
@@ -108,12 +109,12 @@ func (a *guiApp) ymmPage() Widget {
 			CustomRowHeight:     rowH,
 			LastColumnStretched: false,
 			Columns: []TableViewColumn{
-				{Title: "备注", Width: 380},
+				{Title: "备注", Width: 365},
 				{Title: "等级", Width: 55},
 				{Title: "VIP", Width: 50},
 				{Title: "英雄级", Width: 65},
 				{Title: "战区", Width: 95},
-				{Title: "创建时间 ▼", Width: 135},
+				{Title: "创建时间 ▼", Width: 150},
 				{Title: "激活时间", Width: 135},
 			},
 			Model: a.ymm.model,
@@ -156,6 +157,10 @@ func (a *guiApp) ymmPage() Widget {
 
 // ymmQuerySelected 查询选中账号的封号状态。
 func (a *guiApp) ymmQuerySelected() {
+	if a.ymm.isDump() {
+		a.ymm.logf("离线数据源不支持查封：查封要服务器的 ck（CF 登录态），dump 里没有。请切到「数据源：在线」再查")
+		return
+	}
 	row, ok := a.ymm.selected()
 	if !ok {
 		a.ymm.logf("请先选中一行")
@@ -190,25 +195,8 @@ func (a *guiApp) ymmQuerySelected() {
 		st := queryVerifyStatus(a.cfmHost(), row.CardKey)
 		if st.Err != "" {
 			a.ui(func() { a.ymm.logf("失败: %s", st.Err) })
-			appendHistory(a.dir, histEntry{TS: time.Now().UnixMilli(), Action: "verify", QQ: row.QQ, Card: row.CardKey, Result: "失败: " + st.Err})
 			return
 		}
-
-		// 结果不论成败都留档，方便事后核对
-		res := st.Status
-		if st.RateLimited {
-			res = "查询过于频繁"
-		} else if !st.OK {
-			res = st.Message
-		}
-		appendHistory(a.dir, histEntry{
-			TS:     time.Now().UnixMilli(),
-			Action: "verify",
-			QQ:     st.QQ,
-			Card:   row.CardKey,
-			Zone:   st.Zone,
-			Result: res,
-		})
 		if st.RateLimited {
 			a.ui(func() {
 				a.ymm.logf("查询过于频繁，%s 后再试", st.RetryAfter.Round(time.Second))
@@ -299,6 +287,25 @@ func (a *guiApp) ymmVerifyDialog(card string, st verifyStatus) {
 	dlg.Run()
 }
 
+// ymmDeleteSelectedHistory 删除历史列表里选中的那条上号记录。
+func (a *guiApp) ymmDeleteSelectedHistory() {
+	row, ok := a.ymm.selected()
+	if !ok || row.CardKey == "" {
+		return
+	}
+
+	msg := fmt.Sprintf("删除这条上号记录？\n\nQQ：%s\n时间：%s", dash(row.QQ), row.createdText())
+	if walk.MsgBox(a.mw, "确认删除", msg, walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+		return
+	}
+	if e := deleteHistory(a.dir, row.CardKey, row.CreatedAt); e != nil {
+		walk.MsgBox(a.mw, "删除失败", e.Error(), walk.MsgBoxIconWarning)
+		return
+	}
+	a.ymm.logf("已删除历史：%s", dash(row.QQ))
+	a.ymm.refresh()
+}
+
 // ymmCopyCard 复制选中行的卡密。
 func (a *guiApp) ymmCopyCard() {
 	row, ok := a.ymm.selected()
@@ -356,7 +363,7 @@ func (a *guiApp) ymmLaunchOffline(row ymmRow) {
 		return
 	}
 
-	offline, err := ymmBuildOffline(a.ymm.api, a.ymm.snapshot(), row.CardKey)
+	offline, err := ymmBuildOffline(a.ymm.api, a.ymm.snapshot(), row.CardKey, a.ymm.iniDir())
 	if err != nil {
 		a.ymm.logf("准备失败: %v", err)
 		return

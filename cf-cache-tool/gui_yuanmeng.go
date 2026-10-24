@@ -49,11 +49,13 @@ type ymmRow struct {
 	ActivatedAt int64 // 毫秒
 
 	// 以下从 note 里解析，-1 表示没解析到（例如未激活的卡 note 为空）
-	Level    int
-	VIP      int
-	Hero     int
-	Area     string
-	WarZone  string
+	Level   int
+	VIP     int
+	Hero    int
+	Area    string
+	WarZone string
+
+	Hist bool // 来自本机历史：时间显示到秒、排序固定按操作时间倒序
 }
 
 // ymmParseNote 从 note 解析等级 / VIP / 英雄级武器数量 / 区服 / 战区。
@@ -115,10 +117,13 @@ func (r *ymmRow) ymmParseNote() {
 	}
 }
 
-// createdText 创建时间按本地时区显示。
+// createdText 创建时间按本地时区显示；历史行精确到秒，方便区分同一分钟内的多次操作。
 func (r ymmRow) createdText() string {
 	if r.CreatedAt <= 0 {
 		return "-"
+	}
+	if r.Hist {
+		return time.UnixMilli(r.CreatedAt).Format("2006-01-02 15:04:05")
 	}
 	return time.UnixMilli(r.CreatedAt).Format("2006-01-02 15:04")
 }
@@ -189,27 +194,68 @@ var ymmFilters = []ymmFilter{
 	{"本机历史", "history", 0},
 }
 
-// ymmHistoryRows 把本机历史转成列表行，复用同一张表格和按钮。
-func ymmHistoryRows(dir, kw string) []ymmRow {
-	entries := loadHistory(dir, histMaxLoad)
-	rows := make([]ymmRow, 0, len(entries))
-	for _, e := range entries {
-		var action string
-		switch e.Action {
-		case "offline":
-			action = "②上号"
-		case "verify":
-			action = "①查封"
-		default:
-			action = e.Action
-		}
-		note := action + " · " + dash(e.Result) + " · " + dash(e.Zone)
+// histKey 按卡密聚合（没有卡密时退回 QQ）。
+func histKey(e histEntry) string {
+	if s := strings.TrimSpace(e.Card); s != "" {
+		return s
+	}
+	return strings.TrimSpace(e.QQ)
+}
 
-		if kw != "" &&
-			!strings.Contains(e.QQ, kw) && !strings.Contains(e.Card, kw) &&
-			!strings.Contains(e.Note, kw) && !strings.Contains(e.Zone, kw) &&
-			!strings.Contains(note, kw) {
+func histActionLabel(a string) string {
+	switch a {
+	case "offline":
+		return "②上号"
+	case "verify":
+		return "①查封"
+	}
+	return a
+}
+
+func histEntryMatch(e histEntry, kw string) bool {
+	for _, f := range []string{e.QQ, e.Card, e.Note, e.Zone, e.Result, histActionLabel(e.Action)} {
+		if strings.Contains(strings.ToLower(f), kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// ymmHistoryRows 把本机历史转成列表行：同一卡密只显示**最后一次操作**，
+// 时间就是最后一次操作时间，后面附上累计次数。
+func ymmHistoryRows(dir, kw string) []ymmRow {
+	entries := loadHistory(dir, histMaxLoad) // 已按时间倒序
+	kw = strings.ToLower(strings.TrimSpace(kw))
+
+	// 先按关键字过滤（搜索时次数只统计命中的那些）
+	matched := make([]histEntry, 0, len(entries))
+	for _, e := range entries {
+		if e.Action != "offline" { // 历史只看上号记录，查封不进列表
 			continue
+		}
+		if kw != "" && !histEntryMatch(e, kw) {
+			continue
+		}
+		matched = append(matched, e)
+	}
+
+	count := make(map[string]int, len(matched))
+	for _, e := range matched {
+		count[histKey(e)]++
+	}
+
+	seen := make(map[string]bool, len(count))
+	rows := make([]ymmRow, 0, len(count))
+	for _, e := range matched { // matched 保持时间倒序，每个卡密取第一条即最后一次
+		k := histKey(e)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+
+		note := histActionLabel(e.Action) + " · " + dash(e.QQ) + " · " + dash(e.Result) + " · " + dash(e.Zone)
+		if n := count[k]; n > 1 {
+			note += fmt.Sprintf(" · 共 %d 次", n)
 		}
 
 		rows = append(rows, ymmRow{
@@ -221,6 +267,7 @@ func ymmHistoryRows(dir, kw string) []ymmRow {
 			Level:     -1,
 			VIP:       -1,
 			Hero:      -1,
+			Hist:      true,
 		})
 	}
 	return rows
@@ -253,8 +300,87 @@ type ymmPageState struct {
 	rows []ymmRow
 	busy bool
 
-	sortCol int  // 1=创建时间 2=激活时间
-	sortAsc bool // true 升序
+	sortCol  int  // 1=创建时间 2=激活时间
+	sortAsc  bool // true 升序
+	histMode bool // 当前展示的是本机历史（表头改叫「操作时间」）
+
+	btnSource *walk.PushButton
+	btnVerify *walk.PushButton
+	source    string // online / dav
+	dumpDir   string // 离线数据源的本地目录
+	histMenu  *walk.Menu
+}
+
+// syncContextMenu 只在历史模式下挂右键删除菜单，其它模式清掉。
+func (s *ymmPageState) syncContextMenu() {
+	if s.tv == nil {
+		return
+	}
+	if !s.histMode {
+		s.tv.SetContextMenu(nil)
+		return
+	}
+	if s.histMenu == nil {
+		menu, err := walk.NewMenu()
+		if err != nil {
+			return
+		}
+		act := walk.NewAction()
+		_ = act.SetText("删除这条历史")
+		act.Triggered().Attach(func() {
+			if s.app != nil {
+				s.app.ymmDeleteSelectedHistory()
+			}
+		})
+		_ = menu.Actions().Add(act)
+		s.histMenu = menu
+	}
+	s.tv.SetContextMenu(s.histMenu)
+}
+
+// isDump 当前是否用离线（dav）数据源。
+func (s *ymmPageState) isDump() bool { return s.source == srcDav }
+
+// iniDir 上号时 ini 的本地目录（在线模式返回空，走接口取）。
+func (s *ymmPageState) iniDir() string {
+	if s.isDump() {
+		return s.dumpDir
+	}
+	return ""
+}
+
+func (s *ymmPageState) updateSourceBtn() {
+	if s.btnSource != nil {
+		if s.isDump() {
+			s.btnSource.SetText("数据源：离线")
+		} else {
+			s.btnSource.SetText("数据源：在线")
+		}
+	}
+	// 查封要服务器那边的 ck（CF 登录态），离线数据里没有，直接禁用
+	if s.btnVerify != nil {
+		s.btnVerify.SetEnabled(!s.isDump())
+	}
+}
+
+// toggleSource 在线 / 离线 切换，记忆到配置并立即刷新列表。
+func (s *ymmPageState) toggleSource() {
+	if s.isDump() {
+		s.source = srcOnline
+	} else {
+		s.source = srcDav
+	}
+	if s.app != nil && s.app.cfg != nil {
+		s.app.cfg.DataSource = s.source
+		_ = s.app.cfg.save()
+	}
+	s.updateSourceBtn()
+	if s.isDump() {
+		s.logf("数据源切换为离线（dav 打包数据）")
+	} else {
+		s.logf("数据源切换为在线（卡密平台接口）")
+	}
+	s.refresh()
 }
 
 // applySort 按当前排序设置重排列表并刷新表头箭头。
@@ -319,6 +445,9 @@ func (s *ymmPageState) updateHeaders() {
 		return
 	}
 	for i, base := range ymmColumnTitles {
+		if i == 5 && s.histMode {
+			base = "最后操作时间"
+		}
 		title := base
 		if s.sortCol == i {
 			if s.sortAsc {
@@ -418,6 +547,14 @@ func (s *ymmPageState) refresh() {
 	}
 	f := ymmFilters[idx]
 
+	// 历史列表固定按操作时间倒序：最新的一次操作永远在最上面
+	s.histMode = f.Status == "history"
+	if s.histMode {
+		s.sortCol = 5
+		s.sortAsc = false
+	}
+	s.syncContextMenu()
+
 	keyword := ""
 	if s.search != nil {
 		keyword = strings.TrimSpace(s.search.Text())
@@ -503,28 +640,33 @@ func (s *ymmPageState) refresh() {
 			return false
 		}
 
-		// 未开代理且直连 3s 不通 → 自动切代理
-		if !ymmProxy.Enabled() && !s.api.probeDirect(3*time.Second) {
-			ymmProxy.SetEnabled(true)
-			if app != nil {
-				app.ui(func() {
-					if s.chkProxy != nil {
-						s.chkProxy.SetChecked(true)
-					}
-					s.logf("直连 3s 不通，已自动开启代理")
-				})
+		online := s.source != srcDav
+
+		// 离线数据源只读 dav 打包数据，不需要代理和登录
+		if online {
+			// 未开代理且直连 3s 不通 → 自动切代理
+			if !ymmProxy.Enabled() && !s.api.probeDirect(3*time.Second) {
+				ymmProxy.SetEnabled(true)
+				if app != nil {
+					app.ui(func() {
+						if s.chkProxy != nil {
+							s.chkProxy.SetChecked(true)
+						}
+						s.logf("直连 3s 不通，已自动开启代理")
+					})
+				}
 			}
-		}
-		// 代理开着但还没有 IP（含默认开启）：先备好一条可用的
-		if ymmProxy.Enabled() && ymmProxy.addrNow() == "" {
-			if !ensureProxy() {
-				notify("代理均不可用，稍后点搜索重试")
+			// 代理开着但还没有 IP（含默认开启）：先备好一条可用的
+			if ymmProxy.Enabled() && ymmProxy.addrNow() == "" {
+				if !ensureProxy() {
+					notify("代理均不可用，稍后点搜索重试")
+				}
 			}
+			notify("网络：%s", proxyDesc())
 		}
-		notify("网络：%s", proxyDesc())
 
 		var err error
-		if !s.api.loggedIn() {
+		if online && !s.api.loggedIn() {
 			err = s.api.login(cardPassDefault)
 			// 代理 IP 中途失效：换一条再登一次
 			if err != nil && ymmProxy.Enabled() {
@@ -539,7 +681,7 @@ func (s *ymmPageState) refresh() {
 		if err == nil {
 			rows, total, err = s.fetch(f, keyword)
 			// 列表请求失败也换一条 IP 再试
-			if err != nil && ymmProxy.Enabled() {
+			if err != nil && online && ymmProxy.Enabled() {
 				ymmProxy.drop()
 				if e := ymmProxy.warmup(); e == nil && s.api.proxyProbe(4*time.Second) {
 					rows, total, err = s.fetch(f, keyword)
@@ -561,6 +703,10 @@ func (s *ymmPageState) refresh() {
 			s.mu.Unlock()
 			s.applySort()
 
+			if s.isDump() {
+				s.setLabel(fmt.Sprintf("%s：%d 条（离线库内 %d）", f.Label, len(rows), total))
+				return
+			}
 			role := s.api.getRole()
 			if role == "" {
 				role = "unknown"
@@ -596,9 +742,38 @@ func ymmRowMatch(r ymmRow, kw string) bool {
 	return false
 }
 
+// ymmRowFromItem 把接口/dump 的卡密条目转成列表行。
+func ymmRowFromItem(it cardItem) ymmRow {
+	row := ymmRow{
+		QQ:          it.QQ,
+		CardKey:     it.CardKey,
+		QueryCode:   it.QueryCode,
+		Note:        it.Note,
+		Status:      it.Status,
+		CreatedAt:   it.CreatedAt,
+		ActivatedAt: it.ActivatedAt,
+	}
+	row.ymmParseNote()
+	// 未使用的卡密 note 是空的（要等上号器 redeem 才回写），用编号占位便于区分
+	if row.Note == "" {
+		row.Note = it.QueryCode
+	}
+	return row
+}
+
 // fetch 分页拉取并按 Since 过滤，最多 10 页（2000 条）。
 // 关键字不走服务端 q（它只认卡密/QQ，搜不到备注里的区服战区），改成本地模糊匹配。
 func (s *ymmPageState) fetch(f ymmFilter, keyword string) ([]ymmRow, int, error) {
+	// 离线数据源：读 dav 下来的本地 dump，不打接口
+	if s.source == srcDav {
+		dir, err := ensureDump(nil)
+		if err != nil {
+			return nil, 0, err
+		}
+		s.dumpDir = dir
+		return dumpRows(dir, f, keyword)
+	}
+
 	const pageSize = 200
 	var out []ymmRow
 	total := 0
@@ -615,20 +790,7 @@ func (s *ymmPageState) fetch(f ymmFilter, keyword string) ([]ymmRow, int, error)
 		}
 		total = t
 		for _, it := range items {
-			row := ymmRow{
-				QQ:          it.QQ,
-				CardKey:     it.CardKey,
-				QueryCode:   it.QueryCode,
-				Note:        it.Note,
-				Status:      it.Status,
-				CreatedAt:   it.CreatedAt,
-				ActivatedAt: it.ActivatedAt,
-			}
-			row.ymmParseNote()
-			// 未使用的卡密 note 是空的（要等上号器 redeem 才回写），用编号占位便于区分
-			if row.Note == "" {
-				row.Note = it.QueryCode
-			}
+			row := ymmRowFromItem(it)
 			if !ymmRowMatch(row, kw) {
 				continue
 			}

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -43,9 +44,10 @@ type appConfig struct {
 	Profile   string            `json:"profile"`
 	WorkDir   string            `json:"work_dir"`
 	CloudName string            `json:"cloud_name"`
-	AutoCloud bool              `json:"auto_cloud"`
-	ProxyOn   *bool             `json:"proxy_on,omitempty"` // nil = 默认开启
-	Marks     map[string]string `json:"marks,omitempty"`
+	AutoCloud  bool              `json:"auto_cloud"`
+	ProxyOn    *bool             `json:"proxy_on,omitempty"`    // nil = 默认开启
+	DataSource string            `json:"data_source,omitempty"` // "" / online / dav
+	Marks      map[string]string `json:"marks,omitempty"`
 }
 
 func configDirPath() string {
@@ -106,10 +108,21 @@ func (c *appConfig) setMark(card, status string) {
 	c.Marks[card] = status
 }
 
-// proxyDefault 代理开关默认值：没配置过就默认开启（直连 IP 容易被验号接口限频/封）。
+// dataSource 返回数据源（默认在线）。
+func (c *appConfig) dataSource() string {
+	if c == nil || strings.TrimSpace(c.DataSource) == "" {
+		return srcOnline
+	}
+	if c.DataSource == srcDav {
+		return srcDav
+	}
+	return srcOnline
+}
+
+// proxyDefault 代理开关默认值：没配置过就默认不开启（直连优先，不通再自动切代理）。
 func (c *appConfig) proxyDefault() bool {
 	if c == nil || c.ProxyOn == nil {
-		return true
+		return false
 	}
 	return *c.ProxyOn
 }
