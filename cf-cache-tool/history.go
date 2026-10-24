@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -111,6 +112,35 @@ func loadHistory(dir string, limit int) []histEntry {
 		out = out[:limit]
 	}
 	return out
+}
+
+// deleteHistory 删除某一条记录（按卡密 + 时间戳精确定位），删完该卡密会显示更早的一条。
+func deleteHistory(dir, card string, ts int64) error {
+	if dir == "" {
+		return nil
+	}
+	histMu.Lock()
+	defer histMu.Unlock()
+
+	p := historyPath(dir)
+	lines := readHistoryLines(p)
+	kept := make([]string, 0, len(lines))
+	removed := 0
+	for _, line := range lines {
+		var e histEntry
+		if json.Unmarshal([]byte(line), &e) == nil && e.Card == card && e.TS == ts {
+			removed++
+			continue
+		}
+		kept = append(kept, line)
+	}
+	if removed == 0 {
+		return fmt.Errorf("没找到要删除的记录")
+	}
+	if len(kept) == 0 {
+		return os.Remove(p)
+	}
+	return os.WriteFile(p, []byte(strings.Join(kept, "\n")+"\n"), 0o600)
 }
 
 // clearHistory 清空历史文件。
