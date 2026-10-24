@@ -20,6 +20,7 @@ dump.zip
 cf-clone/
 tools/
 work/
+other-tools/
 
 # 通用备份与测试构建
 *.bak
