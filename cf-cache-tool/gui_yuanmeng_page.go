@@ -158,6 +158,11 @@ func (a *guiApp) ymmPage() Widget {
 // ymmQuerySelected 查封按钮：不分数据源，都用行里的卡密调验号接口拿实时封号状态。
 // 离线（dump）列表的行同样带真卡密（来自 cards.jsonl），不需要先切到在线数据源。
 func (a *guiApp) ymmQuerySelected() {
+	// 离线数据源没有 ck，查封做不了（按钮已禁用，这里兜底防其它入口触发）
+	if a.ymm.isDump() {
+		a.ymm.logf("离线数据源暂不支持查封，请点「数据源：离线」切回在线再查")
+		return
+	}
 	row, ok := a.ymm.selected()
 	if !ok {
 		a.ymm.logf("请先选中一行")
