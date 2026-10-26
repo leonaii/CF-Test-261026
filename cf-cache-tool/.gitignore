@@ -1,0 +1,7 @@
+# 构建期生成，含 dav 凭据，不进仓库
+zz_build_secret.go
+.build.env
+
+# 本地产物
+*.exe
+dist/

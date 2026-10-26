@@ -92,7 +92,7 @@ func doDirectLaunch(cfg *appConfig, card string, status func(string)) error {
 
 	status("正在登录卡密平台…")
 	api := newCardClient()
-	if e := api.login(cardPassDefault); e != nil {
+	if e := api.login(adminPass()); e != nil {
 		return fmt.Errorf("登录卡密平台失败：%v", e)
 	}
 

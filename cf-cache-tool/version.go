@@ -1,13 +1,14 @@
 package main
 
-// 版本号：由 build.sh 通过 -ldflags "-X main.toolVersion=x.y.z" 注入。
+// 版本号：正式包由 build.sh 生成 zz_build_secret.go（-tags cg_secret）写死，
+// 源码里不留构建产物信息；本地调试用 buildvars_default.go 的默认值。
 
 import (
 	"strconv"
 	"strings"
 )
 
-var toolVersion = "1.0.0"
+var toolVersion = buildToolVersion()
 
 // parseVersion 解析 1.2.3，解析失败返回 ok=false。
 func parseVersion(s string) (major, minor, patch int, ok bool) {

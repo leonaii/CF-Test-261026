@@ -22,13 +22,28 @@ import (
 )
 
 const (
-	cloudBaseURL  = "https://cloud.51i.cc/remote.php/dav/files/leonai/"
-	cloudUser     = "leonai"
-	cloudPassword = "QGdWe-otHHx-35wCj-MtCKM-owZkK"
-	cloudDir      = "CG"
-	cloudFile     = "cache.zip"
-	cloudRemote   = cloudDir + "/" + cloudFile
+	cloudBaseURL = "https://cloud.51i.cc/remote.php/dav/files/leonai/"
+	cloudDir     = "CG"
+	cloudFile    = "cache.zip"
+	cloudRemote  = cloudDir + "/" + cloudFile
 )
+
+// dav 凭据不打进源码：正式包由 build.sh 生成 zz_build_secret.go（-tags cg_secret）写死，
+// 这样 garble -literals 能把它加密；本地调试用环境变量。
+var (
+	cloudUser     = buildCloudUser()
+	cloudPassword = buildCloudPass()
+)
+
+func init() {
+	if cloudUser == "" {
+		cloudUser = os.Getenv("CG_DAV_USER")
+	}
+	if cloudPassword == "" {
+		cloudPassword = os.Getenv("CG_DAV_PASS")
+	}
+	warmRuntimeConf()
+}
 
 var errCloudNotFound = errors.New("云端还没有备份")
 

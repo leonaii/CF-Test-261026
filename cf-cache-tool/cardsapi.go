@@ -25,10 +25,9 @@ import (
 	"time"
 )
 
-const (
-	cardSrvDefault  = "http://111.170.141.190:8790"
-	cardPassDefault = "admin123" // 自用：管理员口令写死，不提供设置界面
-)
+// 管理口令不再内置：从 dav 的 CG/conf.json（admin_pass）取，改口令不用重发客户端。
+// 卡密平台地址同理，conf.json 的 api_base 可覆盖。
+const cardSrvDefault = "http://111.170.141.190:8790"
 
 type cardClient struct {
 	mu    sync.Mutex
@@ -40,7 +39,7 @@ type cardClient struct {
 
 func newCardClient() *cardClient {
 	return &cardClient{
-		base: cardSrvDefault,
+		base: cardServer(),
 		cli:  &http.Client{Timeout: 20 * time.Second},
 	}
 }
@@ -48,7 +47,7 @@ func newCardClient() *cardClient {
 func (c *cardClient) setBase(base string) {
 	base = strings.TrimRight(strings.TrimSpace(base), "/")
 	if base == "" {
-		base = cardSrvDefault
+		base = cardServer()
 	}
 	c.mu.Lock()
 	c.base = base
@@ -143,7 +142,7 @@ func (c *cardClient) call(method, path string, body []byte) (map[string]any, int
 func (c *cardClient) login(pass string) error {
 	pass = strings.TrimSpace(pass)
 	if pass == "" {
-		return fmt.Errorf("口令为空")
+		return fmt.Errorf("管理口令未加载（dav 配置拉取失败，检查网络后重试）")
 	}
 	body, _ := json.Marshal(map[string]string{"password": pass})
 	m, _, err := c.call(http.MethodPost, "/api/auth/login", body)

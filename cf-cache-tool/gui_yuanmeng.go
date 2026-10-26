@@ -348,14 +348,14 @@ func (s *ymmPageState) updateSourceBtn() {
 			s.btnSource.SetText("数据源：在线")
 		}
 	}
-	// 查封要服务器那边的 ck（CF 登录态），离线数据里没有；
-	// 离线时按钮仍可用，点开是本地快照 + 免登录的实名/人脸实时检查
+	// 查封依赖卡密平台的 ck（CF 登录态），离线数据里没有，所以离线时直接禁用
 	if s.btnVerify != nil {
-		s.btnVerify.SetEnabled(true)
 		if s.isDump() {
-			s.btnVerify.SetText("①查封(快照)")
+			s.btnVerify.SetText("①查封")
+			s.btnVerify.SetEnabled(false)
 		} else {
 			s.btnVerify.SetText("①查封")
+			s.btnVerify.SetEnabled(true)
 		}
 	}
 }
@@ -664,12 +664,12 @@ func (s *ymmPageState) refresh() {
 
 		var err error
 		if online && !s.api.loggedIn() {
-			err = s.api.login(cardPassDefault)
+			err = s.api.login(adminPass())
 			// 代理 IP 中途失效：换一条再登一次
 			if err != nil && ymmProxy.Enabled() {
 				ymmProxy.drop()
 				if e := ymmProxy.warmup(); e == nil && s.api.proxyProbe(4*time.Second) {
-					err = s.api.login(cardPassDefault)
+					err = s.api.login(adminPass())
 				}
 			}
 		}
