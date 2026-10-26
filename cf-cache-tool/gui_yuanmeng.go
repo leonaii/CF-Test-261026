@@ -307,7 +307,6 @@ type ymmPageState struct {
 	btnSource *walk.PushButton
 	btnVerify *walk.PushButton
 	source    string // online / dav
-	dumpDir   string // 离线数据源的本地目录
 	histMenu  *walk.Menu
 }
 
@@ -341,14 +340,6 @@ func (s *ymmPageState) syncContextMenu() {
 // isDump 当前是否用离线（dav）数据源。
 func (s *ymmPageState) isDump() bool { return s.source == srcDav }
 
-// iniDir 上号时 ini 的本地目录（在线模式返回空，走接口取）。
-func (s *ymmPageState) iniDir() string {
-	if s.isDump() {
-		return s.dumpDir
-	}
-	return ""
-}
-
 func (s *ymmPageState) updateSourceBtn() {
 	if s.btnSource != nil {
 		if s.isDump() {
@@ -357,9 +348,15 @@ func (s *ymmPageState) updateSourceBtn() {
 			s.btnSource.SetText("数据源：在线")
 		}
 	}
-	// 查封要服务器那边的 ck（CF 登录态），离线数据里没有，直接禁用
+	// 查封要服务器那边的 ck（CF 登录态），离线数据里没有；
+	// 离线时按钮仍可用，点开是本地快照 + 免登录的实名/人脸实时检查
 	if s.btnVerify != nil {
-		s.btnVerify.SetEnabled(!s.isDump())
+		s.btnVerify.SetEnabled(true)
+		if s.isDump() {
+			s.btnVerify.SetText("①查封(快照)")
+		} else {
+			s.btnVerify.SetText("①查封")
+		}
 	}
 }
 
@@ -764,14 +761,15 @@ func ymmRowFromItem(it cardItem) ymmRow {
 // fetch 分页拉取并按 Since 过滤，最多 10 页（2000 条）。
 // 关键字不走服务端 q（它只认卡密/QQ，搜不到备注里的区服战区），改成本地模糊匹配。
 func (s *ymmPageState) fetch(f ymmFilter, keyword string) ([]ymmRow, int, error) {
-	// 离线数据源：读 dav 下来的本地 dump，不打接口
+	// 离线数据源：只读 dav 上的 cards.jsonl（ini 等上号时再按需取）
 	if s.source == srcDav {
-		dir, err := ensureDump(nil)
+		path, err := ensureDumpCards(nil)
 		if err != nil {
 			return nil, 0, err
 		}
-		s.dumpDir = dir
-		return dumpRows(dir, f, keyword)
+		// 顺手把 zip 目录读到内存，上号时少一趟往返
+		go func() { _, _, _ = dumpSource() }()
+		return dumpRows(path, f, keyword)
 	}
 
 	const pageSize = 200

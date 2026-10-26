@@ -125,7 +125,7 @@ func doDirectLaunch(cfg *appConfig, card string, status func(string)) error {
 	row := ymmRow{QQ: hit.QQ, CardKey: hit.CardKey, Note: hit.Note}
 	row.ymmParseNote()
 
-	d, e := ymmBuildOffline(api, []ymmRow{row}, card, "") // 卡密直登固定走在线接口
+	d, e := ymmBuildOffline(api, []ymmRow{row}, card, false) // 卡密直登固定走在线接口
 	if e != nil {
 		return e
 	}

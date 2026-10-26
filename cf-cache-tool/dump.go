@@ -1,11 +1,13 @@
 package main
 
-// 离线数据源：把 dump（cards.jsonl + data/<QQ>.ini）打包放在 dav 的 CG/dump/，
-// 切到「离线」时下载到本地缓存，列表和上号用的 ini 都从这里读，不再打接口。
+// 离线数据源：dav 上的 CG/dump/dump.zip（cards.jsonl + data/<QQ>.ini）。
+// 不整包下载：只读 zip 的中央目录 + cards.jsonl；ini 在「②上号」时按需 Range 读单个条目，
+// 读到后缓存在本地，后续不再请求。
 
 import (
 	"archive/zip"
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,12 +16,13 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	dumpRemoteZip  = cloudDir + "/dump/dump.zip"
-	dumpRemoteMeta = cloudDir + "/dump/meta.json"
+	dumpRemoteZip   = cloudDir + "/dump/dump.zip"
+	dumpRemoteCards = cloudDir + "/dump/cards.jsonl.gz" // 214KB，一次拿完
 )
 
 // 数据源取值
@@ -28,169 +31,289 @@ const (
 	srcDav    = "dav"    // dav 上的离线打包数据
 )
 
-type dumpMeta struct {
-	Size  int64  `json:"size"`
-	Files int    `json:"files"`
-	Built string `json:"built"`
+// davClient 复用连接（TLS 握手很贵，每次新建连接会让按需读取慢到几十秒）。
+var davClient = &http.Client{Timeout: 90 * time.Second}
+
+// rangeWindow 是预读窗口：zip 的 local header 和文件数据挨着，一次拉 64KB 通常够一个 ini。
+const rangeWindow = 64 << 10
+
+// httpRangeReader 让 archive/zip 按需读远端 zip（HTTP Range + 窗口缓存）。
+type httpRangeReader struct {
+	url  string
+	size int64
+
+	mu     sync.Mutex
+	winOff int64
+	winBuf []byte
 }
 
-func (m dumpMeta) key() string { return fmt.Sprintf("%d-%d", m.Size, m.Files) }
+func (r *httpRangeReader) fetch(off, end int64) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, r.url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(cloudUser, cloudPassword)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end-1))
 
-// dumpCacheDir 本地缓存目录。
-func dumpCacheDir() string { return filepath.Join(configDirPath(), "data", "dump") }
-
-func dumpStampPath() string { return dumpCacheDir() + ".stamp" }
-
-func dumpZipPath() string { return filepath.Join(configDirPath(), "data", "dump.zip") }
-
-func hasDumpData(dir string) bool {
-	st, err := os.Stat(filepath.Join(dir, "cards.jsonl"))
-	return err == nil && st.Size() > 0
+	resp, err := davClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, end-off))
 }
 
-// davGet 带 Basic Auth 的 GET。
-func davGet(url string, timeout time.Duration) (*http.Response, error) {
+// readChunk 从窗口里拷一段，未命中就按窗口对齐拉新的一块。
+func (r *httpRangeReader) readChunk(p []byte, off int64) (int, error) {
+	r.mu.Lock()
+	if r.winBuf != nil && off >= r.winOff && off < r.winOff+int64(len(r.winBuf)) {
+		n := copy(p, r.winBuf[off-r.winOff:])
+		r.mu.Unlock()
+		return n, nil
+	}
+	r.mu.Unlock()
+
+	wOff := off / rangeWindow * rangeWindow
+	wEnd := wOff + rangeWindow
+	if wEnd > r.size {
+		wEnd = r.size
+	}
+	buf, err := r.fetch(wOff, wEnd)
+	if err != nil {
+		return 0, err
+	}
+	r.mu.Lock()
+	r.winOff, r.winBuf = wOff, buf
+	r.mu.Unlock()
+
+	if off < wOff || off >= wOff+int64(len(buf)) {
+		return 0, fmt.Errorf("range 越界")
+	}
+	return copy(p, buf[off-wOff:]), nil
+}
+
+func (r *httpRangeReader) ReadAt(p []byte, off int64) (int, error) {
+	if off >= r.size {
+		return 0, io.EOF
+	}
+	want := len(p)
+	if remain := r.size - off; int64(want) > remain {
+		want = int(remain)
+	}
+
+	got := 0
+	for got < want {
+		n, err := r.readChunk(p[got:want], off+int64(got))
+		if n > 0 {
+			got += n
+		}
+		if err != nil {
+			if got == want {
+				break
+			}
+			return got, err
+		}
+		if n == 0 {
+			break
+		}
+	}
+	if got < len(p) {
+		return got, io.EOF
+	}
+	return got, nil
+}
+
+var (
+	dumpMu   sync.Mutex
+	dumpZip  *zip.Reader
+	dumpSize int64
+	dumpErr  error
+	dumpInit bool
+)
+
+func dumpURL() string { return cloudBaseURL + dumpRemoteZip }
+
+func davHeadSize(url string) (int64, error) {
+	req, err := http.NewRequest(http.MethodHead, url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.SetBasicAuth(cloudUser, cloudPassword)
+	resp, err := davClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("连接云端失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("dump.zip HTTP %d", resp.StatusCode)
+	}
+	if resp.ContentLength <= 0 {
+		return 0, fmt.Errorf("dump.zip 大小未知")
+	}
+	return resp.ContentLength, nil
+}
+
+// dumpSource 进程内只打开一次远端 zip（只读中央目录，几百 KB）。
+func dumpSource() (*zip.Reader, int64, error) {
+	dumpMu.Lock()
+	defer dumpMu.Unlock()
+	if dumpInit {
+		return dumpZip, dumpSize, dumpErr
+	}
+	dumpInit = true
+
+	size, err := davHeadSize(dumpURL())
+	if err != nil {
+		dumpErr = err
+		return nil, 0, err
+	}
+	zr, err := zip.NewReader(&httpRangeReader{url: dumpURL(), size: size}, size)
+	if err != nil {
+		dumpErr = fmt.Errorf("读 zip 目录失败: %v", err)
+		return nil, 0, dumpErr
+	}
+	dumpZip, dumpSize = zr, size
+	return zr, size, nil
+}
+
+func dumpCacheRoot() string { return filepath.Join(configDirPath(), "data", "dump") }
+
+func dumpCardsPath() string { return filepath.Join(dumpCacheRoot(), "cards.jsonl") }
+
+func dumpIniPath(qq string) string { return filepath.Join(dumpCacheRoot(), "data", qq+".ini") }
+
+func dumpStampPath() string { return filepath.Join(dumpCacheRoot(), "stamp") }
+
+// findZipEntry 在 zip 里找条目（兼容 / 与 \ 分隔符）。
+func findZipEntry(zr *zip.Reader, name string) *zip.File {
+	name = strings.ReplaceAll(name, "\\", "/")
+	for _, f := range zr.File {
+		if strings.ReplaceAll(f.Name, "\\", "/") == name {
+			return f
+		}
+	}
+	return nil
+}
+
+// davGet 带 Basic Auth 的 GET（复用连接）。
+func davGet(url string, _ time.Duration) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.SetBasicAuth(cloudUser, cloudPassword)
-	cli := &http.Client{Timeout: timeout}
-	return cli.Do(req)
+	return davClient.Do(req)
 }
 
-func fetchDumpMeta() (dumpMeta, error) {
-	var m dumpMeta
-	resp, err := davGet(cloudBaseURL+dumpRemoteMeta, 10*time.Second)
-	if err != nil {
-		return m, fmt.Errorf("连接云端失败: %v", err)
+// ensureDumpCards 保证本地有 cards.jsonl：只下 214KB 的 gz，不碰整包。
+func ensureDumpCards(logf func(string, ...any)) (string, error) {
+	cached := func() bool {
+		st, e := os.Stat(dumpCardsPath())
+		return e == nil && st.Size() > 0
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return m, fmt.Errorf("meta.json HTTP %d", resp.StatusCode)
-	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if err != nil {
-		return m, err
-	}
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return m, fmt.Errorf("解析 meta.json: %v", err)
-	}
-	return m, nil
-}
-
-// ensureDump 保证本地缓存与云端一致，返回目录。云端不可用时退回本地缓存。
-func ensureDump(logf func(string, ...any)) (string, error) {
-	dir := dumpCacheDir()
-
-	meta, err := fetchDumpMeta()
-	if err != nil {
-		if hasDumpData(dir) {
+	fallback := func(err error) (string, error) {
+		if cached() {
 			if logf != nil {
-				logf("云端不可用，用本地离线数据: %v", err)
+				logf("云端不可用，用本地缓存的离线列表: %v", err)
 			}
-			return dir, nil
+			return dumpCardsPath(), nil
 		}
 		return "", err
 	}
 
-	if hasDumpData(dir) {
-		if raw, e := os.ReadFile(dumpStampPath()); e == nil && strings.TrimSpace(string(raw)) == meta.key() {
-			return dir, nil
+	url := cloudBaseURL + dumpRemoteCards
+	size, err := davHeadSize(url)
+	if err != nil {
+		return fallback(err)
+	}
+
+	key := fmt.Sprintf("%d", size)
+	if cached() {
+		if raw, e := os.ReadFile(dumpStampPath()); e == nil && strings.TrimSpace(string(raw)) == key {
+			return dumpCardsPath(), nil
 		}
 	}
 
 	if logf != nil {
-		logf("下载离线数据（%d 个 ini / %.1f MB）…", meta.Files, float64(meta.Size)/1024/1024)
+		logf("下载离线列表（%.0f KB）…", float64(size)/1024)
 	}
-	if err := downloadDumpZip(); err != nil {
-		if hasDumpData(dir) {
-			if logf != nil {
-				logf("下载失败，继续用本地缓存: %v", err)
-			}
-			return dir, nil
-		}
-		return "", err
-	}
-
-	if logf != nil {
-		logf("解压离线数据…")
-	}
-	if err := unzipDump(dir); err != nil {
-		return "", err
-	}
-	_ = os.WriteFile(dumpStampPath(), []byte(meta.key()), 0o600)
-	return dir, nil
-}
-
-func downloadDumpZip() error {
-	if err := os.MkdirAll(filepath.Dir(dumpZipPath()), 0o700); err != nil {
-		return err
-	}
-	resp, err := davGet(cloudBaseURL+dumpRemoteZip, 10*time.Minute)
+	resp, err := davGet(url, 3*time.Minute)
 	if err != nil {
-		return fmt.Errorf("下载失败: %v", err)
+		return fallback(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("dump.zip HTTP %d", resp.StatusCode)
+		return fallback(fmt.Errorf("cards.jsonl.gz HTTP %d", resp.StatusCode))
 	}
-	f, err := os.OpenFile(dumpZipPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	gz, err := gzip.NewReader(bufio.NewReader(resp.Body))
 	if err != nil {
-		return err
+		return fallback(fmt.Errorf("解压离线列表失败: %v", err))
 	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
-}
+	defer gz.Close()
 
-// unzipDump 解压到 dir，忽略越界路径。
-func unzipDump(dir string) error {
-	zr, err := zip.OpenReader(dumpZipPath())
+	if err := os.MkdirAll(dumpCacheRoot(), 0o700); err != nil {
+		return "", err
+	}
+	tmp := dumpCardsPath() + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return fmt.Errorf("打开 zip: %v", err)
+		return "", err
 	}
-	defer zr.Close()
-
-	_ = os.RemoveAll(dir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	root := filepath.Clean(dir) + string(os.PathSeparator)
-
-	for _, zf := range zr.File {
-		name := filepath.Clean(zf.Name)
-		if strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
-			continue
-		}
-		dst := filepath.Join(dir, name)
-		if !strings.HasPrefix(filepath.Clean(dst)+string(os.PathSeparator), root) {
-			continue
-		}
-		if zf.FileInfo().IsDir() {
-			_ = os.MkdirAll(dst, 0o700)
-			continue
-		}
-		_ = os.MkdirAll(filepath.Dir(dst), 0o700)
-		rc, err := zf.Open()
-		if err != nil {
-			continue
-		}
-		out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-		if err != nil {
-			rc.Close()
-			continue
-		}
-		_, _ = io.Copy(out, rc)
+	if _, err := io.Copy(out, gz); err != nil {
 		out.Close()
-		rc.Close()
+		_ = os.Remove(tmp)
+		return "", err
 	}
-	return nil
+	out.Close()
+	if err := os.Rename(tmp, dumpCardsPath()); err != nil {
+		return "", err
+	}
+	_ = os.WriteFile(dumpStampPath(), []byte(key), 0o600)
+	return dumpCardsPath(), nil
+}
+
+// ensureDumpIni 取某个 QQ 的 ini：先看本地缓存，没有再按需从 zip 读这一个条目。
+func ensureDumpIni(qq string) (string, error) {
+	if qq == "" {
+		return "", fmt.Errorf("QQ 为空")
+	}
+	if raw, err := os.ReadFile(dumpIniPath(qq)); err == nil && len(raw) > 0 {
+		return string(raw), nil
+	}
+
+	zr, _, err := dumpSource()
+	if err != nil {
+		return "", err
+	}
+	entry := findZipEntry(zr, "data/"+qq+".ini")
+	if entry == nil {
+		return "", fmt.Errorf("离线库里没有 %s 的 ini", qq)
+	}
+	rc, err := entry.Open()
+	if err != nil {
+		return "", err
+	}
+	defer rc.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(rc, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) == 0 {
+		return "", fmt.Errorf("离线 ini 为空: %s", qq)
+	}
+	if err := os.MkdirAll(filepath.Dir(dumpIniPath(qq)), 0o700); err == nil {
+		_ = os.WriteFile(dumpIniPath(qq), raw, 0o600)
+	}
+	return string(raw), nil
 }
 
 // dumpRows 从本地 cards.jsonl 生成列表，状态/关键字/排序与在线模式一致。
 func dumpRows(dir string, f ymmFilter, keyword string) ([]ymmRow, int, error) {
-	file, err := os.Open(filepath.Join(dir, "cards.jsonl"))
+	file, err := os.Open(dir)
 	if err != nil {
 		return nil, 0, fmt.Errorf("读 cards.jsonl: %v", err)
 	}
@@ -225,16 +348,4 @@ func dumpRows(dir string, f ymmFilter, keyword string) ([]ymmRow, int, error) {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
 	return out, total, nil
-}
-
-// dumpIni 读本地 data/<qq>.ini。
-func dumpIni(dir, qq string) (string, bool) {
-	if dir == "" || qq == "" {
-		return "", false
-	}
-	raw, err := os.ReadFile(filepath.Join(dir, "data", qq+".ini"))
-	if err != nil || len(raw) == 0 {
-		return "", false
-	}
-	return string(raw), true
 }

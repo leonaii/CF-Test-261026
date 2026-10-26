@@ -1389,6 +1389,8 @@ func (a *guiApp) setVerifyBusy(b bool) {
 
 // storeVerifyResult 把结果写进对应行并刷新该行。
 func (a *guiApp) storeVerifyResult(card string, st verifyStatus) accountRow {
+	// 顺手落一份本地快照，离线数据源没有 ck 时用得上
+	saveVerifySnap(card, st)
 	var updated accountRow
 	for i := range a.model.rows {
 		row := &a.model.rows[i]

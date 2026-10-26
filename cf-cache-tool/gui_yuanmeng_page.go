@@ -155,23 +155,27 @@ func (a *guiApp) ymmPage() Widget {
 	return Composite{Layout: VBox{}, Children: children}
 }
 
-// ymmQuerySelected 查询选中账号的封号状态。
+// ymmQuerySelected 查封按钮：不分数据源，都用行里的卡密调验号接口拿实时封号状态。
+// 离线（dump）列表的行同样带真卡密（来自 cards.jsonl），不需要先切到在线数据源。
 func (a *guiApp) ymmQuerySelected() {
-	if a.ymm.isDump() {
-		a.ymm.logf("离线数据源不支持查封：查封要服务器的 ck（CF 登录态），dump 里没有。请切到「数据源：在线」再查")
-		return
-	}
 	row, ok := a.ymm.selected()
 	if !ok {
 		a.ymm.logf("请先选中一行")
 		return
 	}
 	if row.CardKey == "" {
-		a.ymm.logf("该行没有卡密")
+		a.ymm.logf("该行没有卡密，无法查封")
 		return
 	}
+	a.ymmVerifyRow(row, a.ymm.isDump())
+}
 
-	a.ymm.logf("查询 %s（%s）", row.QQ, row.CardKey)
+// ymmVerifyRow 用卡密查封号。
+// 在线/离线走同一条实时查询路径，区别只在失败兜底：
+// 离线还会补一条免登录的实名/人脸检查，并退到上次成功的本地快照。
+func (a *guiApp) ymmVerifyRow(row ymmRow, offline bool) {
+	qq := strings.TrimSpace(row.QQ)
+	a.ymm.logf("查封 %s（%s）", dash(qq), row.CardKey)
 
 	go func() {
 		a.ui(a.spinBegin)
@@ -188,11 +192,28 @@ func (a *guiApp) ymmQuerySelected() {
 				a.ymm.logf("直连不通，改用代理查询")
 			})
 		}
-
-		desc := proxyDesc()
-		a.ui(func() { a.ymm.logf("网络：%s", desc) })
+		a.ui(func() { a.ymm.logf("网络：%s", proxyDesc()) })
 
 		st := queryVerifyStatus(a.cfmHost(), row.CardKey)
+
+		// 离线兜底：实时查不通（或卡密失效）时用上次快照 + 免登录的实名/人脸
+		if offline && (st.Err != "" || (!st.OK && !st.RateLimited)) {
+			rail := railAntiAddictText(qq)
+			snap, hasSnap := getVerifySnap(qq)
+			reason := firstNonEmpty(st.Err, st.Message, "接口没返回封号信息")
+			a.ui(func() {
+				if hasSnap {
+					at := time.UnixMilli(snap.At)
+					a.ymm.logf("实时查封失败（%s），改用快照 %s", gsClip(reason, 40), at.Format("01-02 15:04"))
+					a.ymmVerifyDialog(verifyDialog{card: row.CardKey, st: snap.snapStatus(), offline: true, snapAt: at, rail: rail})
+					return
+				}
+				a.ymm.logf("查封失败：%s", reason)
+				a.ymmVerifyDialog(verifyDialog{card: row.CardKey, st: st, offline: true, rail: rail})
+			})
+			return
+		}
+
 		if st.Err != "" {
 			a.ui(func() { a.ymm.logf("失败: %s", st.Err) })
 			return
@@ -200,15 +221,12 @@ func (a *guiApp) ymmQuerySelected() {
 		if st.RateLimited {
 			a.ui(func() {
 				a.ymm.logf("查询过于频繁，%s 后再试", st.RetryAfter.Round(time.Second))
-				a.ymmVerifyDialog(row.CardKey, st)
+				a.ymmVerifyDialog(verifyDialog{card: row.CardKey, st: st})
 			})
 			return
 		}
 		if !st.OK {
-			msg := st.Message
-			if msg == "" {
-				msg = "接口返回 ok=false"
-			}
+			msg := firstNonEmpty(st.Message, "接口返回 ok=false")
 			expired := strings.Contains(msg, "失效") || strings.Contains(msg, "过期")
 			a.ui(func() {
 				if expired {
@@ -216,29 +234,51 @@ func (a *guiApp) ymmQuerySelected() {
 				} else {
 					a.ymm.logf("查询失败：%s", msg)
 				}
-				a.ymmVerifyDialog(row.CardKey, st)
+				a.ymmVerifyDialog(verifyDialog{card: row.CardKey, st: st})
 			})
 			return
 		}
+
+		saveVerifySnap(row.CardKey, st)
 		a.ui(func() {
 			a.ymm.logf("QQ=%s 状态=%s 封号=%s 冻结=%s 在线=%s 人脸=%s 令牌=%s 区服=%s",
 				st.QQ, st.Status, st.Fenghao, st.Dongjie, st.Zaixian, st.Renlian, st.Lingpai, st.Zone)
-			a.ymmVerifyDialog(row.CardKey, st)
+			a.ymmVerifyDialog(verifyDialog{card: row.CardKey, st: st})
 		})
 	}()
 }
 
+// verifyDialog 是一次查封弹窗的数据：在线实时查询、离线快照两种来源。
+type verifyDialog struct {
+	card    string
+	st      verifyStatus
+	offline bool
+	snapAt  time.Time // 非零 = 这是离线快照
+	rail    string    // 免登录的实名/人脸实时检查结果
+}
+
 // ymmVerifyDialog 弹框显示验号结果（状态 / 封号 / 冻结 / 在线 / 人脸 / 令牌 / 区服）。
-func (a *guiApp) ymmVerifyDialog(card string, st verifyStatus) {
+func (a *guiApp) ymmVerifyDialog(v verifyDialog) {
+	card, st := v.card, v.st
 	var dlg *walk.Dialog
 	var edit *walk.TextEdit
 
 	var b strings.Builder
-	if !st.OK {
-		fmt.Fprintf(&b, "查询失败：%s\r\n", dash(st.Message))
-		b.WriteString("（接口未返回封号详情，卡密可能已失效）\r\n\r\n")
-	} else if st.RateLimited {
-		b.WriteString("查询过于频繁，请稍后再试\r\n\r\n")
+	if v.offline {
+		b.WriteString("【离线数据源】dump 里只有游戏登录票据，没有查封要的 ck，查不到实时封号。\r\n\r\n")
+		if v.snapAt.IsZero() {
+			b.WriteString("本地还没有这个 QQ 的查封快照。\r\n")
+			b.WriteString("想看封号：切到「数据源：在线」查封一次，结果会自动存成本地快照。\r\n\r\n")
+		} else {
+			fmt.Fprintf(&b, "以下为上次在线查封的快照（%s）：\r\n\r\n", v.snapAt.Format("2006-01-02 15:04"))
+		}
+	} else {
+		if !st.OK {
+			fmt.Fprintf(&b, "查询失败：%s\r\n", dash(st.Message))
+			b.WriteString("（接口未返回封号详情，卡密可能已失效）\r\n\r\n")
+		} else if st.RateLimited {
+			b.WriteString("查询过于频繁，请稍后再试\r\n\r\n")
+		}
 	}
 	fmt.Fprintf(&b, "卡密：%s\r\n", dash(card))
 	fmt.Fprintf(&b, "QQ：%s\r\n", dash(st.QQ))
@@ -255,17 +295,20 @@ func (a *guiApp) ymmVerifyDialog(card string, st verifyStatus) {
 	if st.Level != "" {
 		fmt.Fprintf(&b, "等级：%s\r\n", st.Level)
 	}
-	if !st.At.IsZero() {
+	if !v.offline && !st.At.IsZero() {
 		fmt.Fprintf(&b, "查询时间：%s\r\n", st.At.Format("2006-01-02 15:04:05"))
+	}
+	if v.rail != "" {
+		fmt.Fprintf(&b, "\r\n实名/人脸（实时，免登录）：%s\r\n", v.rail)
 	}
 
 	d := Dialog{
 		AssignTo: &dlg,
 		Title:    "①查封",
-		Size:     Size{Width: 380, Height: 360},
+		Size:     Size{Width: 400, Height: 430},
 		Layout:   VBox{},
 		Children: []Widget{
-			TextEdit{AssignTo: &edit, Text: b.String(), ReadOnly: true, VScroll: true, MinSize: Size{Width: 340, Height: 270}},
+			TextEdit{AssignTo: &edit, Text: b.String(), ReadOnly: true, VScroll: true, MinSize: Size{Width: 360, Height: 340}},
 			Composite{
 				Layout: HBox{},
 				Children: []Widget{
@@ -363,7 +406,7 @@ func (a *guiApp) ymmLaunchOffline(row ymmRow) {
 		return
 	}
 
-	offline, err := ymmBuildOffline(a.ymm.api, a.ymm.snapshot(), row.CardKey, a.ymm.iniDir())
+	offline, err := ymmBuildOffline(a.ymm.api, a.ymm.snapshot(), row.CardKey, a.ymm.isDump())
 	if err != nil {
 		a.ymm.logf("准备失败: %v", err)
 		return

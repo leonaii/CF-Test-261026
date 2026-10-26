@@ -96,13 +96,13 @@ func ymmSealEnvelope(plain []byte) (map[string]any, error) {
 
 // ymmOfflineData 保存 card_key → (qq, note) 映射；ini 按需从接口拉。
 type ymmOfflineData struct {
-	api    *cardClient
-	pin    string            // 选中的卡密：config.ini 里是占位卡密，所有请求都按它取数据
-	iniDir string            // 离线数据源目录（有 data/<qq>.ini 就本地取，不走接口）
-	cards  map[string]ymmRow // card_key -> row
-	byQQ   map[string]string // qq -> card_key
-	mu     sync.Mutex
-	ticket map[string]string // qq -> ini 内容缓存
+	api     *cardClient
+	pin     string            // 选中的卡密：config.ini 里是占位卡密，所有请求都按它取数据
+	offline bool              // 离线数据源：ini 从 dump.zip 按需取
+	cards   map[string]ymmRow // card_key -> row
+	byQQ    map[string]string // qq -> card_key
+	mu      sync.Mutex
+	ticket  map[string]string // qq -> ini 内容缓存
 }
 
 // resolve 把请求里的卡密（可能是 config.ini 的占位卡密）统一换成选中的卡密。
@@ -115,18 +115,18 @@ func (d *ymmOfflineData) resolve(code string) string {
 
 // ymmBuildOffline 用当前列表快照构建离线上号所需的数据。
 // pin 是界面上选中的卡密：上号器读 config.ini 的占位卡密发请求，统一用 pin 取数据。
-func ymmBuildOffline(api *cardClient, rows []ymmRow, pin, iniDir string) (*ymmOfflineData, error) {
-	// 离线数据源直接读本地 ini，不依赖登录态
-	if iniDir == "" && (api == nil || !api.loggedIn()) {
+func ymmBuildOffline(api *cardClient, rows []ymmRow, pin string, offline bool) (*ymmOfflineData, error) {
+	// 离线数据源直接读本地/zip 里的 ini，不依赖登录态
+	if !offline && (api == nil || !api.loggedIn()) {
 		return nil, fmt.Errorf("未登录卡密服务器")
 	}
 	d := &ymmOfflineData{
-		api:    api,
-		pin:    strings.TrimSpace(pin),
-		iniDir: iniDir,
-		cards:  map[string]ymmRow{},
-		byQQ:   map[string]string{},
-		ticket: map[string]string{},
+		api:     api,
+		pin:     strings.TrimSpace(pin),
+		offline: offline,
+		cards:   map[string]ymmRow{},
+		byQQ:    map[string]string{},
+		ticket:  map[string]string{},
 	}
 	for _, r := range rows {
 		if r.CardKey == "" || r.QQ == "" {
@@ -165,8 +165,12 @@ func (d *ymmOfflineData) ticketFor(code string) (string, string, error) {
 	}
 	d.mu.Unlock()
 
-	// 离线数据源：本地有 data/<qq>.ini 就直接用，不打接口
-	if text, ok := dumpIni(d.iniDir, qq); ok {
+	// 离线数据源：本地缓存命中就用，没有再从 dump.zip 里按需读这一个条目
+	if d.offline {
+		text, err := ensureDumpIni(qq)
+		if err != nil {
+			return "", "", err
+		}
 		d.mu.Lock()
 		d.ticket[qq] = text
 		d.mu.Unlock()
