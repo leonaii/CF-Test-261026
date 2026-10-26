@@ -48,6 +48,7 @@ type updateManifestFile struct {
 	SHA256  string `json:"sha256"`
 	Size    int64  `json:"size"`
 	Notes   string `json:"notes"`
+	Sig     string `json:"sig"` // ed25519 签名（构建机私钥），客户端用内置公钥验
 }
 
 // fetchUpdateManifest 读取云端清单；不存在返回 errCloudNotFound。
@@ -62,6 +63,10 @@ func fetchUpdateManifest(ctx context.Context) (*updateManifestFile, error) {
 	}
 	if m.Version == "" {
 		return nil, errors.New("更新清单缺少 version")
+	}
+	// 没有签名或验签失败一律不更新：dav 被写也推不了假包
+	if err := verifyUpdateSig(m.Version, m.SHA256, m.Size, m.Sig); err != nil {
+		return nil, err
 	}
 	return &m, nil
 }
