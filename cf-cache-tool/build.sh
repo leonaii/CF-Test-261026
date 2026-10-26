@@ -60,6 +60,15 @@ LDFLAGS="-s -w -X main.toolVersion=${NEW}"
 DIST="../dist"
 mkdir -p "$DIST"
 
+# macOS 只有 shasum，Git Bash/Linux 只有 sha256sum
+sha256() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        sha256sum "$1" | cut -d' ' -f1
+    fi
+}
+
 echo "==> 编译 CG.exe (windowsgui)"
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath \
     -ldflags "-H=windowsgui ${LDFLAGS}" -o "${DIST}/CG.exe" .
@@ -105,8 +114,8 @@ sync_loader() {
 
     local exe_name exe_sha dat_sha exe_size remote
     exe_name="$(basename "$exe")"
-    exe_sha="$(shasum -a 256 "$exe" | cut -d' ' -f1)"
-    dat_sha="$(shasum -a 256 "$dir/host.dat" | cut -d' ' -f1)"
+    exe_sha="$(sha256 "$exe")"
+    dat_sha="$(sha256 "$dir/host.dat")"
     exe_size="$(wc -c < "$exe" | tr -d ' ')"
 
     remote="$(curl -s -u "$AUTH" "$BASE/CG/loaders/$LOADER_ID/meta.json" || true)"
@@ -145,7 +154,7 @@ if [ "$SYNC_LOADER" = "1" ]; then
 fi
 
 if [ "$PUBLISH" = "1" ]; then
-    SHA="$(shasum -a 256 "${DIST}/CG.exe" | cut -d' ' -f1)"
+    SHA="$(sha256 "${DIST}/CG.exe")"
     SIZE="$(wc -c < "${DIST}/CG.exe" | tr -d ' ')"
     JSON="$(mktemp)"
     cat > "$JSON" <<EOF
