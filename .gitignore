@@ -10,6 +10,8 @@ dist/*.bak
 dist/*.dll
 dist/ntop_v17_dll/
 *.syso.tmp
+# 源码目录里手工编译的临时 exe
+cf-cache-tool/*.exe
 
 # 运行时日志
 *.log
