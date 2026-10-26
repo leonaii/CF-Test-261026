@@ -32,6 +32,7 @@ func usage() {
   push      把本地缓存打包上传到 Nextcloud（云备份）
   pull      从 Nextcloud 下载缓存并合并到本地（云下载）
   cloud     查看云端备份信息
+  gs        查封号：处罚记录 / 冻结 / 在线 / 实名防沉迷 / 登录保护
 
 示例:
   CG serve
@@ -89,6 +90,8 @@ func main() {
 		err = cmdPull(os.Args[2:])
 	case "cloud":
 		err = cmdCloud(os.Args[2:])
+	case "gs":
+		err = cmdGs(os.Args[2:])
 	case "clean":
 		err = cmdClean()
 	case "version", "-v", "--version":
