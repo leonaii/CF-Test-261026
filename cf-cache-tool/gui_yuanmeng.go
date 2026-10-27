@@ -206,6 +206,8 @@ func histActionLabel(a string) string {
 	switch a {
 	case "offline":
 		return "②上号"
+	case "selfop":
+		return "③自研上号"
 	case "verify":
 		return "①查封"
 	}
@@ -230,7 +232,7 @@ func ymmHistoryRows(dir, kw string) []ymmRow {
 	// 先按关键字过滤（搜索时次数只统计命中的那些）
 	matched := make([]histEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.Action != "offline" { // 历史只看上号记录，查封不进列表
+		if e.Action != "offline" && e.Action != "selfop" { // 历史只看上号记录，查封不进列表
 			continue
 		}
 		if kw != "" && !histEntryMatch(e, kw) {
@@ -283,13 +285,14 @@ func ymmFilterLabels() []string {
 
 // ymmPageState 是页面上跨回调共享的状态。
 type ymmPageState struct {
-	tv       *walk.TableView
-	model    *ymmModel
-	label    *walk.Label
-	logBox   *walk.TextEdit
-	chkProxy *walk.CheckBox
-	filter   *walk.ComboBox
-	search   *walk.LineEdit
+	tv          *walk.TableView
+	model       *ymmModel
+	label       *walk.Label
+	logBox      *walk.TextEdit
+	chkProxy    *walk.CheckBox
+	proxyStatus *walk.Label
+	filter      *walk.ComboBox
+	search      *walk.LineEdit
 
 	api *cardClient
 	app *guiApp
@@ -306,7 +309,8 @@ type ymmPageState struct {
 
 	btnSource *walk.PushButton
 	btnVerify *walk.PushButton
-	source    string // online / dav
+	btnSelfOp *walk.PushButton // ③自研上号（仅本页）
+	source    string           // online / dav
 	histMenu  *walk.Menu
 }
 

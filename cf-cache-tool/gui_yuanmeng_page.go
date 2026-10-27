@@ -33,6 +33,7 @@ func (a *guiApp) ymmPage() Widget {
 	ops := []Widget{
 		PushButton{AssignTo: &a.ymm.btnVerify, Text: "①查封", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmQuerySelected},
 		PushButton{Text: "②上号", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmLaunchViaLauncherClick},
+		PushButton{AssignTo: &a.ymm.btnSelfOp, Text: "③自研上号", MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.ymmSelfOpClick},
 		PushButton{Text: "复制卡密", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmCopyCard},
 		PushButton{AssignTo: &a.ymm.btnSource, Text: "数据源：在线", MinSize: Size{Width: 110, Height: btnH}, OnClicked: func() { a.ymm.toggleSource() }},
 		CheckBox{
@@ -46,11 +47,29 @@ func (a *guiApp) ymmPage() Widget {
 					a.cfg.setProxy(on)
 					_ = a.cfg.save()
 				}
-				go func() {
-					desc := proxyDesc() // 取 IP 是网络操作，放后台算
-					a.ui(func() { a.ymm.logf("网络：%s", desc) })
-				}()
+				a.ymm.updateProxyStatus()
+				go func(on bool) {
+					desc := "直连"
+					if on {
+						if err := ymmProxy.warmup(); err != nil {
+							desc = fmt.Sprintf("代理获取失败：%v", err)
+						} else {
+							desc = proxyDesc()
+						}
+					}
+					a.ui(func() {
+						a.ymm.updateProxyStatus()
+						a.ymm.logf("网络：%s", desc)
+					})
+				}(on)
 			},
+		},
+		Label{
+			AssignTo:  &a.ymm.proxyStatus,
+			TextColor: walk.RGB(30, 110, 200),
+			Font:      Font{PointSize: 9},
+			MinSize:   Size{Width: 220},
+			Visible:   false,
 		},
 		HSpacer{},
 	}
@@ -153,6 +172,41 @@ func (a *guiApp) ymmPage() Widget {
 	}
 
 	return Composite{Layout: VBox{}, Children: children}
+}
+
+// updateProxyStatus 在勾选框后显示当前代理及剩余时效。
+func (s *ymmPageState) updateProxyStatus() {
+	if s.proxyStatus == nil {
+		return
+	}
+	enabled, addr, left := ymmProxy.status()
+	if !enabled {
+		s.proxyStatus.SetText("")
+		s.proxyStatus.SetVisible(false)
+		return
+	}
+	s.proxyStatus.SetVisible(true)
+	if addr == "" {
+		s.proxyStatus.SetText("代理 IP：待获取")
+		return
+	}
+	seconds := int(left / time.Second)
+	if seconds < 0 {
+		seconds = 0
+	}
+	s.proxyStatus.SetText(fmt.Sprintf("IP：%s｜剩余：%d 秒", addr, seconds))
+}
+
+// proxyStatusLoop 每秒刷新倒计时，窗口关闭后自动退出。
+func (a *guiApp) proxyStatusLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if a.closing.Load() {
+			return
+		}
+		a.ui(a.ymm.updateProxyStatus)
+	}
 }
 
 // ymmQuerySelected 查封按钮：不分数据源，都用行里的卡密调验号接口拿实时封号状态。
@@ -457,6 +511,157 @@ func (a *guiApp) ymmLaunchOffline(row ymmRow) {
 		}
 		a.ui(func() { a.ymm.logf("上号器已退出，host.dat 已还原") })
 	}()
+}
+
+// ymmSelfOpClick ③自研上号：只用这一行的票据自己换 openid 再启动游戏，
+// 不经过真上号器。按钮只挂在第二界面，第一界面的「自研上号」不受影响。
+func (a *guiApp) ymmSelfOpClick() {
+	row, ok := a.ymm.selected()
+	if !ok {
+		a.ymm.setErr("③自研上号：请先在列表里选中一行")
+		walk.MsgBox(a.mw, "③自研上号", "请先在列表里选中一行", walk.MsgBoxIconWarning)
+		return
+	}
+	if row.QQ == "" || row.CardKey == "" {
+		a.ymm.setErr("③自研上号：该行缺少 QQ 或卡密")
+		walk.MsgBox(a.mw, "③自研上号", "该行缺少 QQ 或卡密", walk.MsgBoxIconWarning)
+		return
+	}
+	// 游戏目录：配置里没有或已失效就弹框选，选完记住（跟离线上号器一样）
+	dir, err := a.selfOpGameDir()
+	if err != nil {
+		a.ymm.setErr("③自研上号：" + err.Error())
+		return
+	}
+	if !a.selfBusy.CompareAndSwap(false, true) {
+		a.ymm.setErr("③自研上号：上一个任务还在执行，稍后再试")
+		return
+	}
+	if a.ymm.btnSelfOp != nil {
+		a.ymm.btnSelfOp.SetEnabled(false)
+	}
+	a.ymm.setLabel("③自研上号：游戏目录 " + dir)
+	go a.ymmSelfOpRun(row, dir)
+}
+
+// ymmSelfOpRun 是 ③ 的实际流程：取 ini → 解析票据 → 换 openid → 启动并注入。
+// 精简模式没有日志框、也不写 run.log，所以进度和失败原因必须写到页面底部状态行，
+// 失败再弹一次框，否则用户看到的就是"点了没反应"。
+func (a *guiApp) ymmSelfOpRun(row ymmRow, dir string) {
+	logf := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		a.ui(func() { a.ymm.logf("%s", msg) })
+	}
+	// step 更新底部状态行（同时留一行日志，非精简模式可见）
+	step := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		logf("%s", msg)
+		a.ui(func() { a.ymm.setLabel("③自研上号：" + msg) })
+	}
+	// fail 是终止性失败：状态行变红 + 弹框，让精简模式也能看见
+	fail := func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		logf("失败：%s", msg)
+		a.ui(func() {
+			a.ymm.setErr("③自研上号失败：" + msg)
+			walk.MsgBox(a.mw, "③自研上号失败", msg, walk.MsgBoxIconError)
+		})
+	}
+
+	defer func() {
+		a.selfBusy.Store(false)
+		a.ui(func() {
+			a.spinEnd()
+			if a.ymm.btnSelfOp != nil {
+				a.ymm.btnSelfOp.SetEnabled(true)
+			}
+		})
+		if r := recover(); r != nil {
+			fail("内部异常：%v", r)
+		}
+	}()
+	a.ui(a.spinBegin)
+	step("开始 %s（QQ %s）", row.CardKey, row.QQ)
+	step("游戏目录：%s", dir)
+
+	// 用客户自己游戏目录里的 rail_api64.dll（不内置、不从 WeGame 取）
+	step("校验游戏目录的 rail_api64.dll…")
+	if desc, err := selfRailDLLInfo(dir); err != nil {
+		fail("%v", err)
+		return
+	} else {
+		step("rail64 就绪：%s", desc)
+	}
+
+	src := "卡密平台"
+	if a.ymm.isDump() {
+		src = "离线数据源"
+	}
+	step("取票据（%s）…", src)
+	iniText, err := a.ymmSelfIni(row.QQ)
+	if err != nil {
+		fail("取 ini 失败：%v", err)
+		return
+	}
+	tk, err := parseYmmTicket(iniText, row.QQ)
+	if err != nil {
+		fail("解析 ini 失败：%v", err)
+		return
+	}
+	step("票据就绪 tgpid=%s machine=%s ct=%s… st=%s…",
+		dash(tk.Tgpid), dash(tk.MachineID), shortHex(tk.CT, 10), shortHex(tk.ST, 10))
+
+	// 真上号器的顺序：LoginByQq 换 OP，再拿返回的 game_st/ctt 去启动。
+	// 直接拿 ini 里的 NT st 打 GetGameTicket 必然 702（票据不是游戏票）。
+	// 真上号器的容错顺序：本地 OP 缓存 → LoginByQq（退避重试）→ CF_Gamest（同 QQ 才认）
+	step("取 OP（缓存 → LoginByQq → CF_Gamest）…")
+	data, err := a.selfOpLoginWithRetry(tk, row.QQ, step)
+	if err != nil {
+		fail("换 OP 失败：%v", err)
+		return
+	}
+	step("OP 票据就绪 openid=%s open_key=%s… ctt=%s…",
+		data.OpenID, shortHex(data.OpenKey, 8), shortHex(data.CTT, 10))
+	if data.CTT == "" {
+		step("注意：回包没有 ctt，游戏可能拒绝登录")
+	}
+
+	step("启动游戏并注入（用该目录的 rail_api64.dll）…")
+	pid, err := selfLaunchGame(dir, data)
+	if err != nil {
+		fail("启动失败：%v", err)
+		return
+	}
+	appendHistory(a.dir, histEntry{
+		TS:     time.Now().UnixMilli(),
+		Action: "selfop",
+		QQ:     row.QQ,
+		Card:   row.CardKey,
+		Note:   row.Note,
+		Zone:   ymmZoneFromNote(row.Note),
+		Result: fmt.Sprintf("已启动 pid=%d", pid),
+	})
+	step("已启动 crossfire.exe pid=%d", pid)
+}
+
+// ymmSelfIni 取某个 QQ 的票据明文：离线读 dump，在线走卡密平台接口。
+func (a *guiApp) ymmSelfIni(qq string) (string, error) {
+	if a.ymm.isDump() {
+		return ensureDumpIni(qq)
+	}
+	if a.ymm.api == nil {
+		return "", fmt.Errorf("卡密平台未初始化")
+	}
+	if !a.ymm.api.loggedIn() {
+		if err := a.ymm.api.login(adminPass()); err != nil {
+			return "", fmt.Errorf("登录卡密平台: %w", err)
+		}
+	}
+	// 启用了代理就先备一条可用 IP，避免直连被限频
+	if ymmProxy.Enabled() {
+		_ = ymmProxy.warmup()
+	}
+	return a.ymm.api.getData(qq)
 }
 
 // cfmHost 返回卡密服务器地址。

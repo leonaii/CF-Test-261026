@@ -253,11 +253,15 @@ func runGUI() (err error) {
 			trace.printf("用户没有完成配置，退出")
 			return nil
 		}
-		// 先校验卡密授权，不通过就不落配置，下次启动重新询问
+		// 先校验卡密授权；只有明确不在名单才拒绝，云端临时不可用不能误判。
 		if err := checkCardLicense(sr.CloudName); err != nil {
-			trace.printf("卡密校验失败: %v", err)
-			walk.MsgBox(nil, "卡密未授权", err.Error()+"\n\n请重新输入卡密。", walk.MsgBoxIconError)
-			return nil
+			if isLicenseUnavailable(err) {
+				trace.printf("白名单暂不可用，跳过本次校验: %v", err)
+			} else {
+				trace.printf("卡密校验失败: %v", err)
+				walk.MsgBox(nil, "卡密未授权", err.Error()+"\n\n请重新输入卡密。", walk.MsgBoxIconError)
+				return nil
+			}
 		}
 
 		if cfg == nil {
@@ -284,14 +288,18 @@ func runGUI() (err error) {
 
 	trace.printf("工作目录=%s 类型=%s 卡密=%s", cfg.WorkDir, cfg.Profile, cfg.CloudName)
 
-	// 已有配置同样要过白名单：名单里没有就清掉卡密，下次启动重新输入
+	// 已有配置同样要过白名单；只有明确不在名单才清卡密，网络超时保留原配置。
 	if !firstRun {
 		if err := checkCardLicense(cfg.CloudName); err != nil {
-			trace.printf("卡密校验失败: %v", err)
-			cfg.CloudName = ""
-			_ = cfg.save()
-			walk.MsgBox(nil, "卡密未授权", err.Error()+"\n\n下次启动请重新输入卡密。", walk.MsgBoxIconError)
-			return nil
+			if isLicenseUnavailable(err) {
+				trace.printf("白名单暂不可用，保留原卡密继续: %v", err)
+			} else {
+				trace.printf("卡密校验失败: %v", err)
+				cfg.CloudName = ""
+				_ = cfg.save()
+				walk.MsgBox(nil, "卡密未授权", err.Error()+"\n\n下次启动请重新输入卡密。", walk.MsgBoxIconError)
+				return nil
+			}
 		}
 	}
 
@@ -431,55 +439,55 @@ func (a *guiApp) createWindow() error {
 	}
 
 	recChildren := []Widget{
-			Composite{
-				Layout: HBox{Spacing: 10},
-				Children: []Widget{
-					Label{AssignTo: &a.headLabel, Text: "CG租号", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 18, Bold: true}},
-					Label{AssignTo: &a.headSub, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
-					HSpacer{},
-					Label{AssignTo: &a.verLabel, Text: "v" + toolVersion, TextColor: walk.RGB(150, 150, 150), Font: Font{PointSize: 8}},
-				},
+		Composite{
+			Layout: HBox{Spacing: 10},
+			Children: []Widget{
+				Label{AssignTo: &a.headLabel, Text: "CG租号", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 18, Bold: true}},
+				Label{AssignTo: &a.headSub, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+				HSpacer{},
+				Label{AssignTo: &a.verLabel, Text: "v" + toolVersion, TextColor: walk.RGB(150, 150, 150), Font: Font{PointSize: 8}},
 			},
-			VSeparator{},
-			Composite{
-				Layout: HBox{Spacing: 6},
-				Children: []Widget{
-					PushButton{AssignTo: &a.btnRecord, Text: "新增", MinSize: Size{Width: 96, Height: 34}, OnClicked: a.startRecord},
-					PushButton{AssignTo: &a.btnReplay, Text: "选中上号", MinSize: Size{Width: 96, Height: 34}, OnClicked: a.startReplay},
-					PushButton{AssignTo: &a.btnMark, Text: "标记", MinSize: Size{Width: 80, Height: 34}, OnClicked: a.markSelected},
-					PushButton{AssignTo: &a.btnVerify, Text: "验证", MinSize: Size{Width: 80, Height: 34}, OnClicked: a.verifySelected},
-					PushButton{AssignTo: &a.btnSelfOp, Text: "自研上号", MinSize: Size{Width: 108, Height: 34}, Enabled: false, OnClicked: a.onSelfOpClick},
-					PushButton{AssignTo: &a.btnCloudRefresh, Text: "刷新", MinSize: Size{Width: 80, Height: 34}, OnClicked: func() { a.refreshCloudList(true) }},
-					HSpacer{},
-					PushButton{AssignTo: &a.btnChoose, Text: "切换上号器", OnClicked: a.reconfigure},
-				},
+		},
+		VSeparator{},
+		Composite{
+			Layout: HBox{Spacing: 6},
+			Children: []Widget{
+				PushButton{AssignTo: &a.btnRecord, Text: "新增", MinSize: Size{Width: 96, Height: 34}, OnClicked: a.startRecord},
+				PushButton{AssignTo: &a.btnReplay, Text: "选中上号", MinSize: Size{Width: 96, Height: 34}, OnClicked: a.startReplay},
+				PushButton{AssignTo: &a.btnMark, Text: "标记", MinSize: Size{Width: 80, Height: 34}, OnClicked: a.markSelected},
+				PushButton{AssignTo: &a.btnVerify, Text: "验证", MinSize: Size{Width: 80, Height: 34}, OnClicked: a.verifySelected},
+				PushButton{AssignTo: &a.btnSelfOp, Text: "自研上号", MinSize: Size{Width: 108, Height: 34}, Enabled: false, OnClicked: a.onSelfOpClick},
+				PushButton{AssignTo: &a.btnCloudRefresh, Text: "刷新", MinSize: Size{Width: 80, Height: 34}, OnClicked: func() { a.refreshCloudList(true) }},
+				HSpacer{},
+				PushButton{AssignTo: &a.btnChoose, Text: "切换上号器", OnClicked: a.reconfigure},
 			},
-			TableView{
-				AssignTo:            &a.tv,
-				AlternatingRowBG:    true,
-				CustomRowHeight:     26,
-				LastColumnStretched: true,
-				Columns: []TableViewColumn{
-					{Title: "状态", Width: 60},
-					{Title: "卡密", Width: 150},
-					{Title: "QQ", Width: 100},
-					{Title: "uid", Width: 110},
-					{Title: "备注", Width: 110},
-					{Title: "区服", Width: 110},
-					{Title: "录制时间", Width: 105},
-					{Title: "原始备注（双击查看）", Width: 320},
-					{Title: "验证数据（双击查看）", Width: 260},
-					{Title: "自研上号", Width: 100},
-				},
-				Model: a.model,
+		},
+		TableView{
+			AssignTo:            &a.tv,
+			AlternatingRowBG:    true,
+			CustomRowHeight:     26,
+			LastColumnStretched: true,
+			Columns: []TableViewColumn{
+				{Title: "状态", Width: 60},
+				{Title: "卡密", Width: 150},
+				{Title: "QQ", Width: 100},
+				{Title: "uid", Width: 110},
+				{Title: "备注", Width: 110},
+				{Title: "区服", Width: 110},
+				{Title: "录制时间", Width: 105},
+				{Title: "原始备注（双击查看）", Width: 320},
+				{Title: "验证数据（双击查看）", Width: 260},
+				{Title: "自研上号", Width: 100},
 			},
-			GroupBox{
-				Title:  "运行日志",
-				Layout: VBox{},
-				Children: []Widget{
-					TextEdit{AssignTo: &a.logBox, ReadOnly: true, VScroll: true, MinSize: Size{Height: 160}},
-				},
+			Model: a.model,
+		},
+		GroupBox{
+			Title:  "运行日志",
+			Layout: VBox{},
+			Children: []Widget{
+				TextEdit{AssignTo: &a.logBox, ReadOnly: true, VScroll: true, MinSize: Size{Height: 160}},
 			},
+		},
 	}
 
 	// 精简模式：不建 TabWidget，只放「在线」页；录制页控件仍创建但隐藏
@@ -525,6 +533,8 @@ func (a *guiApp) createWindow() error {
 	if a.cfg != nil && a.cfg.proxyDefault() && a.ymm.chkProxy != nil {
 		a.ymm.chkProxy.SetChecked(true)
 	}
+	a.ymm.updateProxyStatus()
+	go a.proxyStatusLoop()
 	a.ymm.refresh()
 	return nil
 }
