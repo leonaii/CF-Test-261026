@@ -242,6 +242,9 @@ func appliedVersion() string {
 // checkUpdateCore 检查并替换当前 exe，返回本次生效的版本（"" 表示没有更新）。
 // 全程加锁：首次配置窗口和主界面同时触发时只会下载一次。
 func checkUpdateCore(logf func(string, ...any)) (string, error) {
+	// 主程序由轻量启动器下载和校验，禁止自身替换，避免把启动器写进缓存目录。
+	return "", nil
+
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
