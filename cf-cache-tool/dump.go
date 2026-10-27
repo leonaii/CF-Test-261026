@@ -52,7 +52,7 @@ func (r *httpRangeReader) fetch(off, end int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(cloudUser, cloudPassword)
+	newCloudClient().authorize(req)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, end-1))
 
 	resp, err := davClient.Do(req)
@@ -134,14 +134,14 @@ var (
 	dumpInit bool
 )
 
-func dumpURL() string { return cloudBaseURL + dumpRemoteZip }
+func dumpURL() string { return newCloudClient().urlFor(dumpRemoteZip) }
 
 func davHeadSize(url string) (int64, error) {
 	req, err := http.NewRequest(http.MethodHead, url, nil)
 	if err != nil {
 		return 0, err
 	}
-	req.SetBasicAuth(cloudUser, cloudPassword)
+	newCloudClient().authorize(req)
 	resp, err := davClient.Do(req)
 	if err != nil {
 		return 0, cloudNetworkError("连接云端", err)
@@ -204,7 +204,7 @@ func davGet(url string, timeout time.Duration) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(cloudUser, cloudPassword)
+	newCloudClient().authorize(req)
 	cli := davClient
 	if timeout > 0 {
 		c := *davClient
@@ -234,7 +234,7 @@ func ensureDumpCards(logf func(string, ...any)) (string, error) {
 		return "", err
 	}
 
-	url := cloudBaseURL + dumpRemoteCards
+	url := newCloudClient().urlFor(dumpRemoteCards)
 	size, err := davHeadSize(url)
 	if err != nil {
 		return fallback(err)

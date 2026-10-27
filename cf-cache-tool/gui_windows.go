@@ -194,49 +194,17 @@ type guiApp struct {
 
 func runGUI() (err error) {
 	runtime.LockOSThread()
-	trace := openStartupTrace()
-	defer trace.close()
 	defer func() {
 		if r := recover(); r != nil {
-			trace.printf("panic: %v", r)
 			walk.MsgBox(nil, "CG 启动失败", fmt.Sprintf("%v", r), walk.MsgBoxIconError)
 			err = fmt.Errorf("%v", r)
 		}
 	}()
-	trace.printf("启动 CG v%s", toolVersion)
 
-	// 首次配置窗口也检查更新：后台执行，进度显示在第一界面上
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				trace.printf("检查更新异常: %v", r)
-			}
-		}()
-		emitUpdate("正在检查更新…")
-		v, err := checkUpdateCore(func(f string, args ...any) {
-			msg := fmt.Sprintf(f, args...)
-			trace.printf("%s", msg)
-			emitUpdate(msg)
-		})
-		if err != nil {
-			trace.printf("检查更新失败: %v", err)
-			emitUpdate("检查更新失败：" + err.Error())
-			return
-		}
-		if v != "" {
-			trace.printf("已更新到 v%s（首次界面）", v)
-			emitUpdate("已更新到 v" + v + "，完成配置后自动重启")
-			return
-		}
-		emitUpdate("已是最新版本 v" + toolVersion)
-	}()
-
-	cleanupOldExe(trace.printf)
+	cleanupOldExe(nil)
 
 	cfg := loadAppConfig()
-	if old, moved := migrateWorkDir(cfg); moved {
-		trace.printf("安装目录已迁移: %s -> %s", old, cfg.WorkDir)
-	}
+	_, _ = migrateWorkDir(cfg)
 
 	// CF 卡密每次都要停在第一屏确认，不进第二屏
 	needSetup := cfg == nil || cfg.WorkDir == "" || cfg.CloudName == "" || findProfile(cfg.Profile) == nil
@@ -246,19 +214,13 @@ func runGUI() (err error) {
 
 	firstRun := false
 	if needSetup {
-		trace.printf("需要首次配置")
 		sr, act := runSetupDialog(nil, cfg)
-		trace.printf("配置窗口返回: act=%d result=%+v", act, sr)
 		if act != setupOK {
-			trace.printf("用户没有完成配置，退出")
 			return nil
 		}
 		// 先校验卡密授权；只有明确不在名单才拒绝，云端临时不可用不能误判。
 		if err := checkCardLicense(sr.CloudName); err != nil {
-			if isLicenseUnavailable(err) {
-				trace.printf("白名单暂不可用，跳过本次校验: %v", err)
-			} else {
-				trace.printf("卡密校验失败: %v", err)
+			if !isLicenseUnavailable(err) {
 				walk.MsgBox(nil, "卡密未授权", err.Error()+"\n\n请重新输入卡密。", walk.MsgBoxIconError)
 				return nil
 			}
@@ -276,25 +238,12 @@ func runGUI() (err error) {
 		}
 		firstRun = true
 
-		// 首配期间已经替换好新版本：直接重启进新版本，不再用旧进程开主界面
-		if v := appliedVersion(); v != "" {
-			if exe, e := os.Executable(); e == nil {
-				trace.printf("配置完成，重启到 v%s", v)
-				pendingRestart.Store(exe)
-				return nil
-			}
-		}
 	}
-
-	trace.printf("工作目录=%s 类型=%s 卡密=%s", cfg.WorkDir, cfg.Profile, cfg.CloudName)
 
 	// 已有配置同样要过白名单；只有明确不在名单才清卡密，网络超时保留原配置。
 	if !firstRun {
 		if err := checkCardLicense(cfg.CloudName); err != nil {
-			if isLicenseUnavailable(err) {
-				trace.printf("白名单暂不可用，保留原卡密继续: %v", err)
-			} else {
-				trace.printf("卡密校验失败: %v", err)
+			if !isLicenseUnavailable(err) {
 				cfg.CloudName = ""
 				_ = cfg.save()
 				walk.MsgBox(nil, "卡密未授权", err.Error()+"\n\n下次启动请重新输入卡密。", walk.MsgBoxIconError)
@@ -305,10 +254,7 @@ func runGUI() (err error) {
 
 	// 首屏填的是 CF 卡密：不进主界面，直接走离线上号
 	if card := strings.TrimSpace(cfg.CloudName); looksLikeCard(card) {
-		trace.printf("卡密直登: %s", card)
-
 		if err := runDirectLaunch(cfg, card); err != nil {
-			trace.printf("直登上号失败: %v", err)
 			walk.MsgBox(nil, "上号失败", err.Error()+"\n\n下次启动会直接进入列表界面，可手动选号上号。", walk.MsgBoxIconError)
 		}
 		return nil
@@ -316,13 +262,10 @@ func runGUI() (err error) {
 
 	a := &guiApp{cfg: cfg, firstRun: firstRun}
 	if e := a.init(); e != nil {
-		trace.printf("init 失败: %v", e)
 		walk.MsgBox(nil, "CG 启动失败", e.Error(), walk.MsgBoxIconError)
 		return e
 	}
-	trace.printf("主窗口创建完成，进入消息循环")
 	a.mw.Run()
-	trace.printf("主窗口已退出")
 	return nil
 }
 
@@ -425,10 +368,6 @@ func (a *guiApp) init() error {
 		a.logBox.SetTextColor(walk.RGB(0, 110, 60))
 	}
 	a.logf("使用步骤: 新增 -> 选中账号 -> 选中上号")
-
-	// 后台检查云端更新（不阻塞界面，失败只写日志）
-	go a.checkUpdate()
-
 	return nil
 }
 
@@ -1231,10 +1170,7 @@ func restartIfNeeded() {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000008} // DETACHED_PROCESS
 	if err := cmd.Start(); err == nil {
 		_ = cmd.Process.Release()
-		logRestart("已启动新版本: " + exe)
 		return
-	} else {
-		logRestart("直接启动失败: " + err.Error())
 	}
 
 	// 兜底：交给 shell 启动（CmdLine 原样传入，不经 exec 的引号转义）
@@ -1245,22 +1181,9 @@ func restartIfNeeded() {
 		CreationFlags: 0x08000000,
 	}
 	if err := c.Start(); err != nil {
-		logRestart("shell 启动也失败: " + err.Error())
 		return
 	}
 	_ = c.Process.Release()
-	logRestart("已通过 shell 启动新版本: " + exe)
-}
-
-// logRestart 重启结果写进 startup.log（此时 run.log 已关闭）。
-func logRestart(msg string) {
-	p := filepath.Join(configDirPath(), "startup.log")
-	f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	fmt.Fprintf(f, "%s  [restart] %s\n", time.Now().Format("15:04:05"), msg)
 }
 
 // updateLoaderButtons 上号器没就绪时禁用“录制/回放”，避免点了报错。

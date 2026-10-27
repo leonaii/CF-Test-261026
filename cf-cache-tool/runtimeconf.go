@@ -24,7 +24,7 @@ var (
 	rtOnce sync.Once
 )
 
-func runtimeConfURL() string { return cloudBaseURL + cloudDir + "/conf.json" }
+func runtimeConfURL() string { return newCloudClient().urlFor(cloudDir + "/conf.json") }
 
 // loadRuntimeConf 拉一次配置，失败静默（后续按缺省处理）。
 func loadRuntimeConf() {

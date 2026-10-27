@@ -23,10 +23,11 @@ import (
 )
 
 const (
-	cloudBaseURL = "https://cloud.51i.cc/remote.php/dav/files/leonai/"
-	cloudDir     = "CG"
-	cloudFile    = "cache.zip"
-	cloudRemote  = cloudDir + "/" + cloudFile
+	cloudOrigin       = "https://cloud.51i.cc"
+	cloudShareBaseURL = cloudOrigin + "/public.php/webdav/"
+	cloudDir          = "CG"
+	cloudFile         = "cache.zip"
+	cloudRemote       = cloudDir + "/" + cloudFile
 )
 
 // cloudDirectTransport 只服务 51i.cc：显式禁用代理，并复用 DNS/TLS/连接。
@@ -61,43 +62,55 @@ func cloudNetworkError(action string, err error) error {
 	return fmt.Errorf("%s失败，请检查网络连接", action)
 }
 
-// dav 凭据不打进源码：正式包由 build.sh 生成 zz_build_secret.go（-tags cg_secret）写死，
-// 这样 garble -literals 能把它加密；本地调试用环境变量。
+// 客户端只持有只读分享的 token / 口令，不再内置 Nextcloud 主账号密码。
+// 正式包由 build.sh 生成 zz_build_secret.go（-tags cg_secret）；本地调试用环境变量。
 var (
-	cloudUser     = buildCloudUser()
-	cloudPassword = buildCloudPass()
+	cloudShareToken = buildCloudShareToken()
+	cloudSharePass  = buildCloudSharePass()
 )
 
 func init() {
-	if cloudUser == "" {
-		cloudUser = os.Getenv("CG_DAV_USER")
+	if cloudShareToken == "" {
+		cloudShareToken = os.Getenv("CG_SHARE_TOKEN")
 	}
-	if cloudPassword == "" {
-		cloudPassword = os.Getenv("CG_DAV_PASS")
+	if cloudSharePass == "" {
+		cloudSharePass = os.Getenv("CG_SHARE_PASS")
 	}
 	warmRuntimeConf()
 }
 
-var errCloudNotFound = errors.New("云端还没有备份")
+var (
+	errCloudNotFound = errors.New("云端还没有备份")
+	errCloudReadOnly = errors.New("当前为只读云分享模式，云端写入已禁用")
+)
 
 type cloudClient struct {
 	base string
-	user string
-	pass string
+	user string // 公开分享 token
+	pass string // 公开分享口令
 	http *http.Client
 }
 
 func newCloudClient() *cloudClient {
 	return &cloudClient{
-		base: cloudBaseURL,
-		user: cloudUser,
-		pass: cloudPassword,
+		base: cloudShareBaseURL,
+		user: cloudShareToken,
+		pass: cloudSharePass,
 		http: newCloudHTTPClient(90 * time.Second),
 	}
 }
 
 func (c *cloudClient) urlFor(path string) string {
-	p := strings.Trim(path, "/")
+	p := strings.TrimSpace(path)
+	if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
+		return p
+	}
+	p = strings.Trim(p, "/")
+	if p == cloudDir {
+		p = ""
+	} else if strings.HasPrefix(p, cloudDir+"/") {
+		p = strings.TrimPrefix(p, cloudDir+"/")
+	}
 	if p == "" {
 		return c.base
 	}
@@ -112,13 +125,21 @@ func (c *cloudClient) urlFor(path string) string {
 	return u
 }
 
+func (c *cloudClient) authorize(req *http.Request) {
+	if c.user != "" {
+		req.SetBasicAuth(c.user, c.pass)
+	}
+	req.Header.Set("User-Agent", "CG/"+toolVersion)
+	// 部分 Nextcloud 配置下公开 WebDAV 需要这个头（与官方文档的 cURL 示例一致）。
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+}
+
 func (c *cloudClient) do(ctx context.Context, method, path string, body io.Reader, size int64) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.urlFor(path), body)
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(c.user, c.pass)
-	req.Header.Set("User-Agent", "CG/"+toolVersion)
+	c.authorize(req)
 	if size >= 0 {
 		req.ContentLength = size
 	}
@@ -137,37 +158,14 @@ func drain(resp *http.Response) {
 	_ = resp.Body.Close()
 }
 
-// ensureDir 创建远端目录，已存在时 WebDAV 返回 405。
+// ensureDir 在只读分享模式下不再提供写能力。
 func (c *cloudClient) ensureDir(ctx context.Context, dir string) error {
-	resp, err := c.do(ctx, "MKCOL", dir+"/", nil, 0)
-	if err != nil {
-		return err
-	}
-	defer drain(resp)
-	switch resp.StatusCode {
-	case 200, 201, 204, 301, 302, 405:
-		return nil
-	case 401:
-		return errors.New("Nextcloud 账号或应用密码错误（401）")
-	}
-	return fmt.Errorf("创建云端目录失败: HTTP %d", resp.StatusCode)
+	return errCloudReadOnly
 }
 
+// upload 在只读分享模式下不再提供写能力。
 func (c *cloudClient) upload(ctx context.Context, path string, data []byte) error {
-	resp, err := c.do(ctx, "PUT", path, bytes.NewReader(data), int64(len(data)))
-	if err != nil {
-		return err
-	}
-	defer drain(resp)
-	switch {
-	case resp.StatusCode/100 == 2:
-		return nil
-	case resp.StatusCode == 401:
-		return errors.New("Nextcloud 账号或应用密码错误（401）")
-	case resp.StatusCode == 507:
-		return errors.New("云端空间不足（507）")
-	}
-	return fmt.Errorf("上传失败: HTTP %d", resp.StatusCode)
+	return errCloudReadOnly
 }
 
 func (c *cloudClient) download(ctx context.Context, path string) ([]byte, error) {
@@ -178,7 +176,7 @@ func (c *cloudClient) download(ctx context.Context, path string) ([]byte, error)
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK:
-		data, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 128<<20))
 		if err != nil {
 			return nil, fmt.Errorf("读取云端文件失败: %w", err)
 		}
@@ -186,7 +184,7 @@ func (c *cloudClient) download(ctx context.Context, path string) ([]byte, error)
 	case http.StatusNotFound:
 		return nil, errCloudNotFound
 	case http.StatusUnauthorized:
-		return nil, errors.New("Nextcloud 账号或应用密码错误（401）")
+		return nil, errors.New("云端只读分享令牌或口令错误（401）")
 	}
 	return nil, fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
 }
@@ -198,9 +196,8 @@ func (c *cloudClient) stat(ctx context.Context, path string) (int64, time.Time, 
 	if err != nil {
 		return 0, time.Time{}, err
 	}
-	req.SetBasicAuth(c.user, c.pass)
+	c.authorize(req)
 	req.Header.Set("Depth", "0")
-	req.Header.Set("User-Agent", "CG/"+toolVersion)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -212,7 +209,7 @@ func (c *cloudClient) stat(ctx context.Context, path string) (int64, time.Time, 
 	case http.StatusNotFound:
 		return 0, time.Time{}, errCloudNotFound
 	case http.StatusUnauthorized:
-		return 0, time.Time{}, errors.New("Nextcloud 账号或应用密码错误（401）")
+		return 0, time.Time{}, errors.New("云端只读分享令牌或口令错误（401）")
 	case http.StatusMultiStatus, http.StatusOK:
 	default:
 		return 0, time.Time{}, fmt.Errorf("查询云端文件失败: HTTP %d", resp.StatusCode)
@@ -387,24 +384,7 @@ func unpackCache(data []byte, cacheDir string) (int, error) {
 
 // cloudBackup 上传本地缓存，返回文件数与字节数。
 func cloudBackup(ctx context.Context, cacheDir, remotePath string) (int, int64, error) {
-	if remotePath == "" {
-		remotePath = cloudRemote
-	}
-	data, files, err := packCache(cacheDir)
-	if err != nil {
-		return 0, 0, err
-	}
-	if files == 0 {
-		return 0, 0, errors.New("本地没有可备份的缓存")
-	}
-	c := newCloudClient()
-	if err := c.ensureDir(ctx, filepath.ToSlash(filepath.Dir(remotePath))); err != nil {
-		return 0, 0, err
-	}
-	if err := c.upload(ctx, remotePath, data); err != nil {
-		return 0, 0, err
-	}
-	return files, int64(len(data)), nil
+	return 0, 0, errCloudReadOnly
 }
 
 // cloudRestore 下载云端备份并合并到本地缓存目录。
@@ -434,7 +414,7 @@ func cloudInfo(ctx context.Context, remotePath string) (int64, time.Time, error)
 
 // listEntries 列出目录下的 zip 文件名与子目录名。
 func (c *cloudClient) listEntries(ctx context.Context, dir string) (files, dirs []string, err error) {
-	req, err := http.NewRequestWithContext(ctx, "PROPFIND", c.urlFor(dir)+"/", nil)
+	req, err := http.NewRequestWithContext(ctx, "PROPFIND", strings.TrimRight(c.urlFor(dir), "/")+"/", nil)
 	if err != nil {
 		return nil, nil, err
 	}

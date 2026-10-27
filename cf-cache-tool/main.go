@@ -52,6 +52,9 @@ func logf(format string, args ...any) {
 }
 
 func main() {
+	// 旧版本留下的启动日志和上号器下载缓存都已停用，启动时顺手清掉。
+	_ = os.Remove(filepath.Join(configDirPath(), "startup.log"))
+	cleanupLoaderCache()
 	if len(os.Args) < 2 {
 		// 单实例：已经开了一个就不再开第二个
 		if !ensureSingleInstance() {
@@ -466,7 +469,7 @@ func cmdPush(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	logf("云备份 -> %s/", cloudBaseURL+cloudBaseDir(n, "1"))
+	logf("云备份 -> %s", newCloudClient().urlFor(cloudBaseDir(n, "1")+"/"))
 	count, err := cloudSyncAll(ctx, n, "1", *cache)
 	if err != nil {
 		return err
@@ -488,7 +491,7 @@ func cmdPull(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	logf("云下载 <- %s/index.json", cloudBaseURL+cloudBaseDir(n, "1"))
+	logf("云下载 <- %s/index.json", newCloudClient().urlFor(cloudBaseDir(n, "1")))
 	total, err := cloudPullAll(ctx, n, "1", *cache, func(f string, a ...any) { logf(f, a...) })
 	if err != nil {
 		return err
@@ -537,7 +540,7 @@ func cmdCloud(args []string) error {
 	if len(idx.Cards) == 0 {
 		return errCloudNotFound
 	}
-	fmt.Println("云端路径:", cloudBaseURL+cloudBaseDir(n, "1")+"/")
+	fmt.Println("云端路径:", newCloudClient().urlFor(cloudBaseDir(n, "1")+"/"))
 	fmt.Printf("账号数: %d   索引更新: %s\n", len(idx.Cards), idx.Updated)
 	fmt.Printf("%-4s %-18s %-12s %-6s %s\n", "#", "CARD", "QQ", "标记", "录制时间")
 	for i, e := range idx.Cards {

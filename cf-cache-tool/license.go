@@ -5,6 +5,7 @@ package main
 // 不在名单里的卡密不允许进入主界面。
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -23,20 +24,25 @@ var (
 func isLicenseUnavailable(err error) bool { return errors.Is(err, errLicenseUnavailable) }
 func isLicenseDenied(err error) bool      { return errors.Is(err, errLicenseDenied) }
 
-// fetchLicenseList 拉取白名单，返回统一大写后的卡密集合。
+// fetchLicenseList 从只读分享拉取白名单，返回统一大写后的卡密集合。
 func fetchLicenseList(timeout time.Duration) (map[string]struct{}, error) {
-	cli := newCloudHTTPClient(timeout)
-	req, err := http.NewRequest(http.MethodGet, cloudBaseURL+cloudDir+"/"+licenseRemote, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	c := newCloudClient()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.urlFor(cloudDir+"/"+licenseRemote), nil)
 	if err != nil {
 		return nil, err
 	}
-	req.SetBasicAuth(cloudUser, cloudPassword)
+	c.authorize(req)
 
-	resp, err := cli.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, cloudNetworkError("连接云端", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("只读分享令牌或口令失效（401）")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("云端返回 HTTP %d", resp.StatusCode)
 	}

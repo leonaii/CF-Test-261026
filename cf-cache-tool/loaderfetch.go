@@ -35,41 +35,9 @@ type installedLoader struct {
 
 func loaderMarkerPath(dir string) string { return filepath.Join(dir, ".loader.json") }
 
-// 跨工作目录的下载缓存：%AppData%\CG\loaders\<id>\<sha>，换目录/清目录都不用重新下载
-func loaderCacheDir(id string) string {
-	if id == "" {
-		id = "1"
-	}
-	return filepath.Join(configDirPath(), "loaders", id)
-}
-
-func loaderCacheExe(id, sha string) string {
-	return filepath.Join(loaderCacheDir(id), "exe-"+sha)
-}
-
-func loaderCacheDat(id, sha string) string {
-	return filepath.Join(loaderCacheDir(id), "dat-"+sha)
-}
-
-// copyFile 复制文件并返回目标大小。
-func copyFile(src, dst string) (int64, error) {
-	in, err := os.Open(src)
-	if err != nil {
-		return 0, err
-	}
-	defer in.Close()
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-		return 0, err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o700)
-	if err != nil {
-		return 0, err
-	}
-	n, err := io.Copy(out, in)
-	if cerr := out.Close(); err == nil {
-		err = cerr
-	}
-	return n, err
+// cleanupLoaderCache 清理旧版本遗留的本地上号器下载缓存。
+func cleanupLoaderCache() {
+	_ = os.RemoveAll(filepath.Join(configDirPath(), "loaders"))
 }
 
 func readLoaderMarker(dir string) *installedLoader {
@@ -174,18 +142,6 @@ func syncLoader(ctx context.Context, dir string, p *loaderProfile, logf func(str
 		}
 	}
 	if needExe {
-		// 先看本机缓存（换工作目录/清目录时不用重新下载）
-		cached := loaderCacheExe(p.ID, meta.ExeSHA)
-		if _, err := os.Stat(cached); err == nil {
-			if sha, e := fileSHA256(cached); e == nil && strings.EqualFold(sha, meta.ExeSHA) {
-				if _, e := copyFile(cached, exePath); e == nil {
-					logf("上号器取自本地缓存: %s", meta.Exe)
-					needExe = false
-				}
-			}
-		}
-	}
-	if needExe {
 		logf("下载上号器: %s (%.1f MB)", meta.Exe, float64(meta.ExeSize)/1024/1024)
 		data, err := c.download(ctx, loaderExePath(p.ID, meta.Exe))
 		if err != nil {
@@ -199,11 +155,6 @@ func syncLoader(ctx context.Context, dir string, p *loaderProfile, logf func(str
 		}
 		if err := os.WriteFile(exePath, data, 0o700); err != nil {
 			return "", fmt.Errorf("写入上号器失败（可能没有权限）: %w", err)
-		}
-		// 存一份到本机缓存，下次换目录不用再下
-		if meta.ExeSHA != "" {
-			_ = os.MkdirAll(loaderCacheDir(p.ID), 0o700)
-			_ = os.WriteFile(loaderCacheExe(p.ID, meta.ExeSHA), data, 0o700)
 		}
 	}
 
@@ -219,27 +170,20 @@ func syncLoader(ctx context.Context, dir string, p *loaderProfile, logf func(str
 		needDat = true
 	}
 	if needDat {
-		data, err := os.ReadFile(loaderCacheDat(p.ID, meta.DatSHA))
-		if err != nil || meta.DatSHA == "" {
-			data, err = c.download(ctx, loaderDatPath(p.ID))
-			if err != nil {
-				return "", fmt.Errorf("下载 host.dat 失败: %w", err)
+		data, err := c.download(ctx, loaderDatPath(p.ID))
+		if err != nil {
+			return "", fmt.Errorf("下载 host.dat 失败: %w", err)
+		}
+		if meta.DatSHA != "" {
+			sum := sha256.Sum256(data)
+			if !strings.EqualFold(hex.EncodeToString(sum[:]), meta.DatSHA) {
+				return "", errors.New("host.dat 校验失败，已丢弃")
 			}
-			if meta.DatSHA != "" {
-				sum := sha256.Sum256(data)
-				if !strings.EqualFold(hex.EncodeToString(sum[:]), meta.DatSHA) {
-					return "", errors.New("host.dat 校验失败，已丢弃")
-				}
-				_ = os.MkdirAll(loaderCacheDir(p.ID), 0o700)
-				_ = os.WriteFile(loaderCacheDat(p.ID, meta.DatSHA), data, 0o600)
-			}
-			logf("已下载 host.dat")
-		} else {
-			logf("host.dat 取自本地缓存")
 		}
 		if err := os.WriteFile(datPath, data, 0o600); err != nil {
 			return "", fmt.Errorf("写入 host.dat 失败: %w", err)
 		}
+		logf("已下载 host.dat")
 		// 旧备份作废，避免还原时把老版本写回去
 		_ = os.Remove(datPath + ".orig")
 	}

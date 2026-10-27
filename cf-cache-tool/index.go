@@ -18,7 +18,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -110,22 +109,7 @@ func fetchCloudIndex(ctx context.Context, name, pid string) (*cloudIndex, error)
 }
 
 func putCloudIndex(ctx context.Context, name, pid string, idx *cloudIndex) error {
-	idx.Version = 1
-	idx.Updated = time.Now().Format("2006-01-02 15:04:05")
-	sort.Slice(idx.Cards, func(i, j int) bool { return idx.Cards[i].Card < idx.Cards[j].Card })
-
-	data, err := json.MarshalIndent(idx, "", "  ")
-	if err != nil {
-		return err
-	}
-	c := newCloudClient()
-	if err := c.ensureDir(ctx, cloudBaseDir(name, pid)+"/"); err != nil {
-		return err
-	}
-	if err := c.ensureDir(ctx, cloudBaseDir(name, pid)+"/cards/"); err != nil {
-		return err
-	}
-	return c.upload(ctx, cloudIndexPath(name, pid), data)
+	return errCloudReadOnly
 }
 
 // packCardDir 把 cache/<card>/ 下的缓存文件打成 zip（内部仍用 card/ 前缀）。
@@ -230,30 +214,7 @@ func unpackCardZip(cacheDir, card string, data []byte) (int, error) {
 
 // uploadCardCloud 上传单个账号缓存，并把它写进索引。
 func uploadCardCloud(ctx context.Context, name, pid, cacheDir, card string, entry cloudCardEntry) error {
-	data, _, err := packCardDir(cacheDir, card)
-	if err != nil {
-		return err
-	}
-	c := newCloudClient()
-	dir := cloudBaseDir(name, pid)
-	if err := c.ensureDir(ctx, dir+"/"); err != nil {
-		return err
-	}
-	if err := c.ensureDir(ctx, dir+"/cards/"); err != nil {
-		return err
-	}
-	if err := c.upload(ctx, cloudCardPath(name, pid, card), data); err != nil {
-		return err
-	}
-
-	idx, err := fetchCloudIndex(ctx, name, pid)
-	if err != nil {
-		return err
-	}
-	entry.Card = card
-	entry.Size = int64(len(data))
-	idx.upsert(entry)
-	return putCloudIndex(ctx, name, pid, idx)
+	return errCloudReadOnly
 }
 
 // downloadCardCloud 按需下载单个账号缓存。
@@ -268,15 +229,7 @@ func downloadCardCloud(ctx context.Context, name, pid, cacheDir, card string) (i
 
 // updateCloudMark 只改索引里这条的标记。
 func updateCloudMark(ctx context.Context, name, pid, card, mark string) error {
-	idx, err := fetchCloudIndex(ctx, name, pid)
-	if err != nil {
-		return err
-	}
-	if idx.find(card) == nil {
-		return nil // 云端没这条（还没上传过），下次录制时会带上
-	}
-	idx.setMark(card, mark)
-	return putCloudIndex(ctx, name, pid, idx)
+	return errCloudReadOnly
 }
 
 func entryRecorded(e cloudCardEntry) time.Time {
@@ -320,53 +273,7 @@ func dash(s string) string {
 
 // cloudSyncAll 把本地全部账号按新结构上传，并重建云端索引（也可用于旧 zip 迁移）。
 func cloudSyncAll(ctx context.Context, name, pid, cacheDir string) (int, error) {
-	rows := loadAccountRows(NewCache(cacheDir))
-	if len(rows) == 0 {
-		return 0, errors.New("本地没有可备份的缓存")
-	}
-	idx, err := fetchCloudIndex(ctx, name, pid)
-	if err != nil {
-		return 0, err
-	}
-	done := 0
-	for _, r := range rows {
-		e := cloudCardEntry{
-			Card:    r.Card,
-			QQ:      cleanField(r.QQ),
-			OpenID:  cleanField(r.OpenID),
-			Zone:    cleanField(r.Zone),
-			Note:    cleanField(r.Note),
-			RawNote: cleanField(r.RawNote),
-		}
-		if !r.Recorded.IsZero() {
-			e.Recorded = r.Recorded.Format("2006-01-02 15:04:05")
-		}
-		if old := idx.find(r.Card); old != nil {
-			e.Mark = old.Mark
-		}
-		data, _, err := packCardDir(cacheDir, r.Card)
-		if err != nil {
-			return done, err
-		}
-		c := newCloudClient()
-		// 先建 <名称>/<类型>/，再建 cards/，否则父目录不存在会 409
-		if err := c.ensureDir(ctx, cloudBaseDir(name, pid)+"/"); err != nil {
-			return done, err
-		}
-		if err := c.ensureDir(ctx, cloudBaseDir(name, pid)+"/cards/"); err != nil {
-			return done, err
-		}
-		if err := c.upload(ctx, cloudCardPath(name, pid, r.Card), data); err != nil {
-			return done, err
-		}
-		e.Size = int64(len(data))
-		idx.upsert(e)
-		done++
-	}
-	if err := putCloudIndex(ctx, name, pid, idx); err != nil {
-		return done, err
-	}
-	return done, nil
+	return 0, errCloudReadOnly
 }
 
 // cloudPullAll 只下载本地缺失的账号（按需），并返回云端条目数。
