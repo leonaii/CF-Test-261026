@@ -93,14 +93,12 @@ func selfGetGameTicket(t *selfTicket, ct, st, sessionID string, saveDir string) 
 	if err != nil {
 		return nil, err
 	}
-	r, err := selfRandR()
-	if err != nil {
-		return nil, err
-	}
 	nonce, err := selfNewNonce()
 	if err != nil {
 		return nil, err
 	}
+	timestamp := time.Now().Unix()
+	r := selfEpRequestR(timestamp, nonce, t.MachineID)
 
 	uid := t.UID
 	if uid == "" {
@@ -110,7 +108,7 @@ func selfGetGameTicket(t *selfTicket, ct, st, sessionID string, saveDir string) 
 		sessionID = "0"
 	}
 	extBase := fmt.Sprintf("ext=%s&gid=%d&nonce=%s&session_id=%s&timestamp=%d&uid=%s&version=%s",
-		strings.ToUpper(t.MachineID), selfGameID, nonce, sessionID, time.Now().Unix(), uid, selfVersionTag)
+		strings.ToUpper(t.MachineID), selfGameID, nonce, sessionID, timestamp, uid, selfVersionTag)
 	sign := selfSign(r, body, extBase)
 	ws, err := selfWsEncode(extBase + "&sign=" + sign)
 	if err != nil {
@@ -173,23 +171,23 @@ func selfSaveGameDiag(dir string, t *selfTicket, body, ws, url, r string, res *s
 		return ""
 	}
 	rec := map[string]any{
-		"card":      t.Card,
-		"qq":        t.QQ,
-		"uid":       t.UID,
-		"url":       url,
-		"r":         r,
-		"body":      body,
-		"ws":        ws,
-		"http":      res.HTTPStatus,
-		"trace_id":  res.TraceID,
-		"ep":        res.EPHex,
-		"plain":     string(res.Plain),
-		"openid":    res.OpenID,
-		"open_key":  res.OpenKey,
-		"ctt":       res.CTT,
-		"expire":    res.Expire,
-		"raw":       string(raw),
-		"at":        time.Now().Format(time.RFC3339),
+		"card":     t.Card,
+		"qq":       t.QQ,
+		"uid":      t.UID,
+		"url":      url,
+		"r":        r,
+		"body":     body,
+		"ws":       ws,
+		"http":     res.HTTPStatus,
+		"trace_id": res.TraceID,
+		"ep":       res.EPHex,
+		"plain":    string(res.Plain),
+		"openid":   res.OpenID,
+		"open_key": res.OpenKey,
+		"ctt":      res.CTT,
+		"expire":   res.Expire,
+		"raw":      string(raw),
+		"at":       time.Now().Format(time.RFC3339),
 	}
 	b, _ := json.MarshalIndent(rec, "", "  ")
 	d := filepath.Join(dir, "selfop")

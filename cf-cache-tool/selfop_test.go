@@ -30,6 +30,30 @@ func TestSelfEpDecodeVector(t *testing.T) {
 	t.Logf("_ep 明文: %s", plain)
 }
 
+func TestSelfEpDerivedRVector(t *testing.T) {
+	const machineID = "CC815BEE32490F9CA4F6CC7F116E4469"
+	const want = "3702800218351216143717"
+	if got := selfEpRequestR(1793097317, "BXYBPD", machineID); got != want {
+		t.Fatalf("request R=%s want %s", got, want)
+	}
+	if got := selfEpResponseR(1793097317, "BXYBPD", machineID); got != want {
+		t.Fatalf("response R=%s want %s", got, want)
+	}
+}
+
+func TestSelfEpDecodeDerivedVector(t *testing.T) {
+	const machineID = "CC815BEE32490F9CA4F6CC7F116E4469"
+	ep := "7160cf42b8a6e4fd97397388ea5ab70822f3695446f5d18bbe841a0f03ee62c3caad4079a8711db67ec469f8e39ac8033430ec366e68f5d082a3d5072d8964fc"
+	r := selfEpResponseR(1793095598, "PZBZVN", machineID)
+	plain, err := selfEpDecode(ep, r)
+	if err != nil {
+		t.Fatalf("派生 R 解密失败: %v", err)
+	}
+	if !strings.Contains(string(plain), "8000150") || !strings.Contains(string(plain), "not match") {
+		t.Fatalf("明文不符合预期: %s", plain)
+	}
+}
+
 func TestBuildMidListMatchesCapture(t *testing.T) {
 	got, err := buildMidList("8AC936BFCC316D3D660CB564B40F0188")
 	if err != nil {

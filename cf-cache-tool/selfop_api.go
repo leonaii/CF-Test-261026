@@ -58,24 +58,64 @@ func selfBuildLoginPlain(t *selfTicket, midList string) string {
 	)
 }
 
-// selfLoginByQq 走一次完整的三层封装并发送请求。
+// selfBuildLoginPlainV6 是 qq_info_type=6 的模板（样本 .rdata 0xF7741 / 0xF7E49）：
+// openid/sig/client_key/st_key 都是 NT 登录产物；head.credential 还要带 ct/ctt/dt/sk。
+func selfBuildLoginPlainV6(t *selfTicket, midList string) string {
+	return fmt.Sprintf(
+		`{"mappid":%d,"clienttype":%d,"login_info":{"qq_info_type":6,"appid":%d,"openid":"%s","sig":"%s","client_key":"%s","st_key":"%s"},`+
+			`"config_params":{"lang_type":0,"login_type":1,"channel_id":0,"promote_id":"0",`+
+			`"client_version":"%s","client_dev_name":"%s"},`+
+			`"head":{"credential":{"game_ver":"","ct":"%s","ctt":"%s","dt":"%s","sk":"%s","mid_list":"%s","wg_client_ver":"%s"}}}`,
+		selfMappid, selfClientType, selfAppID, firstNonEmpty(t.UID, t.QQ), t.Sig,
+		strings.TrimSpace(t.Raw["client_key"]), strings.TrimSpace(t.Raw["st_key"]),
+		selfWGClientVer, t.ClientDevName(),
+		t.CT, strings.TrimSpace(t.Raw["ctt"]), strings.TrimSpace(t.Raw["dt"]), strings.TrimSpace(t.Raw["sk"]),
+		midList, selfWGClientVer,
+	)
+}
+
+// selfLoginByQq 走一次完整的三层封装并发送请求（qq_info_type=4，纯 QQ + sig）。
 func selfLoginByQq(t *selfTicket, saveDir string) (*selfLoginResult, error) {
+	return selfLoginByQqPlain(t, false, saveDir, true)
+}
+
+// selfLoginByQqV6 用 qq_info_type=6（client_key/st_key）登录，真上号器 NT 登录后走这条。
+func selfLoginByQqV6(t *selfTicket, saveDir string) (*selfLoginResult, error) {
+	return selfLoginByQqPlain(t, true, saveDir, true)
+}
+
+// selfLoginByQqV6Plain 同 V6，但 body 不套 _eq 直接发明文：
+// 服务端对明文请求回的是明文 JSON，报错码能直接看（_ep 解不开时的兜底）。
+func selfLoginByQqV6Plain(t *selfTicket, saveDir string) (*selfLoginResult, error) {
+	return selfLoginByQqPlain(t, true, saveDir, false)
+}
+
+func selfLoginByQqPlain(t *selfTicket, useOpenID bool, saveDir string, encrypt bool) (*selfLoginResult, error) {
 	midList, err := buildMidList(t.MachineID)
 	if err != nil {
 		return nil, err
 	}
 	plain := selfBuildLoginPlain(t, midList)
-	body, r, err := selfEqEncode([]byte(plain))
-	if err != nil {
-		return nil, err
+	if useOpenID {
+		plain = selfBuildLoginPlainV6(t, midList)
 	}
-
 	nonce, err := selfNewNonce()
 	if err != nil {
 		return nil, err
 	}
+	timestamp := time.Now().Unix()
+	r := selfEpRequestR(timestamp, nonce, t.MachineID)
+	var body string
+	if encrypt {
+		body, err = selfEqEncodeWithR([]byte(plain), r)
+	} else {
+		body = plain
+	}
+	if err != nil {
+		return nil, err
+	}
 	extBase := fmt.Sprintf("ext=%s&gid=%d&nonce=%s&session_id=0&timestamp=%d&uid=0&version=%s",
-		strings.ToUpper(t.MachineID), selfUDIDGid, nonce, time.Now().Unix(), selfVersionTag)
+		strings.ToUpper(t.MachineID), selfUDIDGid, nonce, timestamp, selfVersionTag)
 	sign := selfSign(r, body, extBase)
 	ws, err := selfWsEncode(extBase + "&sign=" + sign)
 	if err != nil {
@@ -114,11 +154,18 @@ func selfLoginByQq(t *selfTicket, saveDir string) (*selfLoginResult, error) {
 		res.TraceID = parsed.TraceID
 	}
 
-	// 先按“请求用的 R”试一次（一般解不开，解开了说明服务端复用了请求密钥）
+	// 与样本一致：先试请求 R，再试由 timestamp/nonce/machineID 派生的响应 R。
 	if res.EPHex != "" {
 		if p, e := selfEpDecode(res.EPHex, r); e == nil {
 			res.Plain = p
 			res.UsedR = r
+		}
+		if len(res.Plain) == 0 {
+			responseR := selfEpResponseR(timestamp, nonce, t.MachineID)
+			if p, e := selfEpDecode(res.EPHex, responseR); e == nil {
+				res.Plain = p
+				res.UsedR = responseR
+			}
 		}
 	}
 

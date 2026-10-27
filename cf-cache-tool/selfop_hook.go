@@ -237,28 +237,56 @@ func selfServeHostPipe() func() {
 	}
 }
 
-// selfEnsureHookDLL 把内嵌的 qwh_cf_hook.dll 释放到 exe 同级目录。
-//
-// 样本里的相对路径是 "ntop_v17_dll\x64"（.rdata 0x1400DC8F8），
-// 基准是上号器自身目录 —— 不是 %TEMP%。ACE 对 TEMP 下的 DLL 更敏感，
-// 放到 exe 同级才与上号器一致。
-func selfEnsureHookDLL() (string, error) {
+// selfEnsureHookDLL 把内嵌的 qwh_cf_hook.dll 释放到客户游戏目录的
+// ntop_v17_dll\x64（与样本的相对路径一致）；游戏目录不可写时退回 exe 同级。
+// ACE 对 %TEMP% 下的 DLL 更敏感，所以不用临时目录。
+func selfEnsureHookDLL(gameDir string) (string, error) {
 	if len(selfHookDLL) == 0 {
 		return "", fmt.Errorf("未内嵌 hook DLL")
 	}
-	base := exeDir()
-	dir := base + `\ntop_v17_dll\x64`
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
+	dir := ""
+	if gameDir != "" {
+		dir = gameDir + `\ntop_v17_dll\x64`
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			dir = ""
+		}
+	}
+	if dir == "" {
+		dir = exeDir() + `\ntop_v17_dll\x64`
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
 	}
 	p := dir + `\qwh_cf_hook.dll`
 	if st, err := os.Stat(p); err == nil && st.Size() == int64(len(selfHookDLL)) {
+		selfLog("hook 已存在 %s (%d)", p, st.Size())
+		selfEnsureFakeRail(dir)
 		return p, nil
 	}
 	if err := os.WriteFile(p, selfHookDLL, 0o644); err != nil {
+		selfLog("写 hook 失败 %s: %v", p, err)
 		return "", err
 	}
+	selfLog("写 hook 成功 %s (%d)", p, len(selfHookDLL))
+	selfEnsureFakeRail(dir)
 	return p, nil
+}
+
+// selfEnsureFakeRail 在 ntop_v17_dll\x64 下放一个 1 字节的假 rail_api64.dll。
+//
+// 复刻样本 sub_140019270 @0x14001A51C：拼 "<dir>\rail_api64.dll" → fopen("wb")
+// → fwrite("x", 1, 1) → fclose。CF 在这个路径拿到无效镜像后 LoadLibrary 失败，
+// 就不再走 WeGame 初始化，从而不会弹 "WeGame Init Failed (2310)"。
+func selfEnsureFakeRail(dir string) {
+	p := dir + `\rail_api64.dll`
+	if st, err := os.Stat(p); err == nil && st.Size() == 1 {
+		return
+	}
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		selfLog("写假 rail 失败 %s: %v", p, err)
+		return
+	}
+	selfLog("写假 rail 成功 %s", p)
 }
 
 // exeDir 返回当前可执行文件所在目录。

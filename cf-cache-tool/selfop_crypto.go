@@ -24,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
+	"strings"
 )
 
 var (
@@ -100,6 +102,31 @@ func selfKDF(r string) (key, iv []byte) {
 	return
 }
 
+// selfEpDerivedR 复刻样本的确定性 R：decimal(m) + decimal(hash)。
+// m 由 timestamp 和 0x1400F97E8 表派生，滚动哈希使用 64 位自然溢出。
+func selfEpDerivedR(timestamp int64, input string) string {
+	table := [...]uint32{0x58880A08, 0x6C4B6A28, 0x0DB2D93B}
+	x := uint32(timestamp) ^ 0xD2AD4E72
+	r := (x - 0x5E295AB4) ^ table[(x+0x56)%3]
+	m := uint64(0x5600000000) + uint64(r)
+	var h uint64
+	for i := 0; i < len(input); i++ {
+		h = h*m + uint64(input[i])
+	}
+	h &= 0x7FFFFFFF
+	return strconv.FormatUint(m, 10) + strconv.FormatUint(h, 10)
+}
+
+// selfEpRequestR 对应 sub_140038080/sub_140050CE0：
+// 请求签名和 _ep 响应都使用 hash(C10+nonce+machineID+"0")。
+func selfEpRequestR(timestamp int64, nonce, machineID string) string {
+	return selfEpDerivedR(timestamp, "C10"+nonce+strings.ToUpper(machineID)+"0")
+}
+
+func selfEpResponseR(timestamp int64, nonce, machineID string) string {
+	return selfEpRequestR(timestamp, nonce, machineID)
+}
+
 // selfRandR 生成 22 位十进制随机串。
 func selfRandR() (string, error) {
 	limit := new(big.Int).Exp(big.NewInt(10), big.NewInt(22), nil)
@@ -120,12 +147,17 @@ func selfEqEncode(plain []byte) (body string, r string, err error) {
 	if err != nil {
 		return "", "", err
 	}
+	body, err = selfEqEncodeWithR(plain, r)
+	return body, r, err
+}
+
+func selfEqEncodeWithR(plain []byte, r string) (string, error) {
 	key, iv := selfKDF(r)
 	ct, err := aesCBCEncrypt(key, iv, plain)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-	return `{"_eq":"` + hexUpper(ct) + `"}`, r, nil
+	return `{"_eq":"` + hexUpper(ct) + `"}`, nil
 }
 
 // selfSign 计算 HMAC-SHA256(R, body‖extBase)。
