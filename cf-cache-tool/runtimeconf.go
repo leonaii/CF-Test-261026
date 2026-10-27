@@ -28,7 +28,7 @@ func runtimeConfURL() string { return cloudBaseURL + cloudDir + "/conf.json" }
 
 // loadRuntimeConf 拉一次配置，失败静默（后续按缺省处理）。
 func loadRuntimeConf() {
-	resp, err := davGet(runtimeConfURL(), 8*time.Second)
+	resp, err := davGet(runtimeConfURL(), 3*time.Second)
 	if err != nil {
 		return
 	}
@@ -65,7 +65,7 @@ func rtCurrent() runtimeConf {
 }
 
 // adminPass 卡密平台管理口令：只从 dav 的 conf.json 取。
-// 预热还没完成时同步等一次（最多 8 秒）；拉不到返回空串，登录会提示口令未加载。
+// 预热还没完成时同步等一次（最多 3 秒）；拉不到返回空串，登录会提示口令未加载。
 func adminPass() string {
 	if p := rtCurrent().AdminPass; p != "" {
 		return p

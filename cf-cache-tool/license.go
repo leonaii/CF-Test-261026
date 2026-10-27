@@ -5,6 +5,7 @@ package main
 // 不在名单里的卡密不允许进入主界面。
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,9 +15,17 @@ import (
 
 const licenseRemote = "mm.md"
 
+var (
+	errLicenseUnavailable = errors.New("卡密授权服务暂不可用")
+	errLicenseDenied      = errors.New("卡密不在授权名单")
+)
+
+func isLicenseUnavailable(err error) bool { return errors.Is(err, errLicenseUnavailable) }
+func isLicenseDenied(err error) bool      { return errors.Is(err, errLicenseDenied) }
+
 // fetchLicenseList 拉取白名单，返回统一大写后的卡密集合。
 func fetchLicenseList(timeout time.Duration) (map[string]struct{}, error) {
-	cli := &http.Client{Timeout: timeout}
+	cli := newCloudHTTPClient(timeout)
 	req, err := http.NewRequest(http.MethodGet, cloudBaseURL+cloudDir+"/"+licenseRemote, nil)
 	if err != nil {
 		return nil, err
@@ -25,7 +34,7 @@ func fetchLicenseList(timeout time.Duration) (map[string]struct{}, error) {
 
 	resp, err := cli.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("连接云端失败: %v", err)
+		return nil, cloudNetworkError("连接云端", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -66,7 +75,7 @@ func looksLikeCard(s string) bool {
 }
 
 // checkCardLicense 校验卡密是否在授权名单里。
-// 网络失败会重试一次；拉不到名单一律按拒绝处理。
+// 只请求一次并短超时；网络失败返回 errLicenseUnavailable，不能被当成“未授权”。
 func checkCardLicense(card string) error {
 	card = strings.ToUpper(strings.TrimSpace(card))
 	if card == "" {
@@ -78,20 +87,12 @@ func checkCardLicense(card string) error {
 		return nil
 	}
 
-	var lastErr error
-	for try := 1; try <= 2; try++ {
-		set, err := fetchLicenseList(8 * time.Second)
-		if err != nil {
-			lastErr = err
-			if try == 1 {
-				time.Sleep(600 * time.Millisecond)
-			}
-			continue
-		}
-		if _, ok := set[card]; ok {
-			return nil
-		}
-		return fmt.Errorf("卡密 %s 不在授权名单里", card)
+	set, err := fetchLicenseList(4 * time.Second)
+	if err != nil {
+		return fmt.Errorf("%w：%v", errLicenseUnavailable, err)
 	}
-	return fmt.Errorf("无法校验卡密（联网失败）：%v", lastErr)
+	if _, ok := set[card]; !ok {
+		return fmt.Errorf("%w：%s", errLicenseDenied, card)
+	}
+	return nil
 }

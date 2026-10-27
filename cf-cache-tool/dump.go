@@ -31,8 +31,8 @@ const (
 	srcDav    = "dav"    // dav 上的离线打包数据
 )
 
-// davClient 复用连接（TLS 握手很贵，每次新建连接会让按需读取慢到几十秒）。
-var davClient = &http.Client{Timeout: 90 * time.Second}
+// davClient 复用直连连接（TLS 握手很贵，每次新建连接会让按需读取慢到几十秒）。
+var davClient = newCloudHTTPClient(90 * time.Second)
 
 // rangeWindow 是预读窗口：zip 的 local header 和文件数据挨着，一次拉 64KB 通常够一个 ini。
 const rangeWindow = 64 << 10
@@ -57,7 +57,7 @@ func (r *httpRangeReader) fetch(off, end int64) ([]byte, error) {
 
 	resp, err := davClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, cloudNetworkError("读取云端文件", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
@@ -144,7 +144,7 @@ func davHeadSize(url string) (int64, error) {
 	req.SetBasicAuth(cloudUser, cloudPassword)
 	resp, err := davClient.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("连接云端失败: %v", err)
+		return 0, cloudNetworkError("连接云端", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -198,14 +198,24 @@ func findZipEntry(zr *zip.Reader, name string) *zip.File {
 	return nil
 }
 
-// davGet 带 Basic Auth 的 GET（复用连接）。
-func davGet(url string, _ time.Duration) (*http.Response, error) {
+// davGet 带 Basic Auth 的 GET（复用连接，并按调用方要求限制本次超时）。
+func davGet(url string, timeout time.Duration) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.SetBasicAuth(cloudUser, cloudPassword)
-	return davClient.Do(req)
+	cli := davClient
+	if timeout > 0 {
+		c := *davClient
+		c.Timeout = timeout
+		cli = &c
+	}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return nil, cloudNetworkError("连接云端", err)
+	}
+	return resp, nil
 }
 
 // ensureDumpCards 保证本地有 cards.jsonl：只下 214KB 的 gz，不碰整包。

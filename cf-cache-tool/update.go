@@ -78,7 +78,7 @@ func downloadUpdate(ctx context.Context, curExe string, m *updateManifestFile) (
 		path = updateDir + "/" + strings.TrimPrefix(m.File, "/")
 	}
 
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := newCloudHTTPClient(10 * time.Minute)
 	c := newCloudClient()
 	req, err := http.NewRequestWithContext(ctx, "GET", c.urlFor(path), nil)
 	if err != nil {
@@ -89,7 +89,7 @@ func downloadUpdate(ctx context.Context, curExe string, m *updateManifestFile) (
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("下载更新失败: %w", err)
+		return "", cloudNetworkError("下载更新", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
@@ -253,10 +253,12 @@ func checkUpdateCore(logf func(string, ...any)) (string, error) {
 		return v, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
-
-	m, err := fetchUpdateManifest(ctx)
+	// 清单请求必须短超时：云端抖动时不能把首屏一直卡在“检查更新”。
+	start := time.Now()
+	manifestCtx, cancelManifest := context.WithTimeout(context.Background(), 5*time.Second)
+	m, err := fetchUpdateManifest(manifestCtx)
+	cancelManifest()
+	selfLog("更新清单耗时 %s", time.Since(start).Round(10*time.Millisecond))
 	if err != nil {
 		if errors.Is(err, errCloudNotFound) {
 			return "", nil
@@ -266,6 +268,9 @@ func checkUpdateCore(logf func(string, ...any)) (string, error) {
 	if !versionNewer(m.Version, toolVersion) {
 		return "", nil
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
 
 	exe, err := os.Executable()
 	if err != nil {

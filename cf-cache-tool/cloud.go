@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +28,38 @@ const (
 	cloudFile    = "cache.zip"
 	cloudRemote  = cloudDir + "/" + cloudFile
 )
+
+// cloudDirectTransport 只服务 51i.cc：显式禁用代理，并复用 DNS/TLS/连接。
+var cloudDirectTransport = &http.Transport{
+	Proxy: nil,
+	DialContext: (&net.Dialer{
+		Timeout:   8 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+	ForceAttemptHTTP2:     true,
+	MaxIdleConns:          32,
+	MaxIdleConnsPerHost:   16,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   8 * time.Second,
+	ExpectContinueTimeout: time.Second,
+}
+
+func newCloudHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Transport: cloudDirectTransport, Timeout: timeout}
+}
+
+// cloudNetworkError 给界面返回不含接口地址的简短错误，详细错误只写本地日志。
+func cloudNetworkError(action string, err error) error {
+	if err == nil {
+		return nil
+	}
+	selfLog("%s失败: %T", action, err)
+	var ne net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+		return fmt.Errorf("%s超时，请稍后重试", action)
+	}
+	return fmt.Errorf("%s失败，请检查网络连接", action)
+}
 
 // dav 凭据不打进源码：正式包由 build.sh 生成 zz_build_secret.go（-tags cg_secret）写死，
 // 这样 garble -literals 能把它加密；本地调试用环境变量。
@@ -59,7 +92,7 @@ func newCloudClient() *cloudClient {
 		base: cloudBaseURL,
 		user: cloudUser,
 		pass: cloudPassword,
-		http: &http.Client{Timeout: 90 * time.Second},
+		http: newCloudHTTPClient(90 * time.Second),
 	}
 }
 
@@ -91,7 +124,7 @@ func (c *cloudClient) do(ctx context.Context, method, path string, body io.Reade
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("连接 Nextcloud 失败: %w", err)
+		return nil, cloudNetworkError("连接云端", err)
 	}
 	return resp, nil
 }
@@ -171,7 +204,7 @@ func (c *cloudClient) stat(ctx context.Context, path string) (int64, time.Time, 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, time.Time{}, fmt.Errorf("连接 Nextcloud 失败: %w", err)
+		return 0, time.Time{}, cloudNetworkError("连接云端", err)
 	}
 	defer resp.Body.Close()
 
@@ -411,7 +444,7 @@ func (c *cloudClient) listEntries(ctx context.Context, dir string) (files, dirs 
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("连接 Nextcloud 失败: %w", err)
+		return nil, nil, cloudNetworkError("连接云端", err)
 	}
 	defer resp.Body.Close()
 

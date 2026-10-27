@@ -21,8 +21,8 @@ import (
 
 const (
 	proxyFetchURL    = "http://api.tianqiip.com/getip?secret=yek5w5or&num=1&type=txt&port=1&mr=1&sign=441bfbbfa9dea28120618b3c3477e721"
-	proxyTTL         = 3 * time.Minute  // 一个 IP 用 180s
-	proxyMinInterval = 2 * time.Minute  // 两次取 IP 的最小间隔
+	proxyTTL         = 3 * time.Minute // 一个 IP 用 180s
+	proxyMinInterval = 2 * time.Minute // 两次取 IP 的最小间隔
 	proxyFetchTimout = 12 * time.Second
 )
 
@@ -192,9 +192,9 @@ func (p *proxyPool) client() *http.Client {
 	return &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
-			Proxy:              http.ProxyURL(u),
-			DisableKeepAlives:  true,
-			IdleConnTimeout:    10 * time.Second,
+			Proxy:             http.ProxyURL(u),
+			DisableKeepAlives: true,
+			IdleConnTimeout:   10 * time.Second,
 		},
 	}
 }
@@ -225,6 +225,20 @@ func (p *proxyPool) addrNow() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.addr
+}
+
+// status 返回界面展示所需的代理状态，不触发网络请求。
+func (p *proxyPool) status() (bool, string, time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.enabled {
+		return false, "", 0
+	}
+	p.loadCacheLocked()
+	if p.addr == "" {
+		return true, "", 0
+	}
+	return true, p.addr, time.Until(p.expire)
 }
 
 // proxyDesc 用于日志展示。
