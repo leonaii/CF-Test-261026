@@ -7,11 +7,12 @@
 #   ./build.sh 1.2.0 --publish
 #   ./build.sh --no-loader  跳过上号器资源同步（离线打包时用）
 #
-# 凭据：读 .build.env（或同名环境变量），构建时生成 zz_build_secret.go 参与编译，
-#       源码与仓库里不留 dav 明文；有 garble 时自动用它混淆字符串。
+# 凭据：.build.env 里的 DAV_USER / DAV_PASS 只用于构建机上传和创建只读分享，
+#       不进入任何客户端二进制。客户端只拿只读分享 token / 口令。
 #
-# 产物：../dist/CG.exe、../dist/CG-cli.exe
-# 云端：CG/update/CG.exe + CG/update/version.json（带 ed25519 签名）
+# 产物：../dist/CG.exe（唯一对外分发的启动器）
+#       ../dist/cloud/* 仅为本地上传暂存，不对外分发
+# 云端：CG/app/* 为新版主程序清单；CG/update/* 保留用于旧客户端迁移。
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -72,28 +73,58 @@ fi
 echo "$NEW" > "$VER_FILE"
 echo "==> 版本: $CUR -> $NEW"
 
+# ---------- 只读分享 ----------
+# 构建机用 DAV 账号维护 CG 根目录的只读公开分享；客户端只拿到分享 token / 口令。
+SHARE_STATE=".cg-share.env"
+echo "==> 同步 Nextcloud 只读分享"
+CGO_ENABLED=0 go run share_provision.go
+if [ -f "$SHARE_STATE" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . "./$SHARE_STATE"
+    set +a
+fi
+if [ -z "${CG_SHARE_TOKEN:-}" ] || [ -z "${CG_SHARE_PASS:-}" ]; then
+    echo "错误: 只读分享凭据未生成（检查 $SHARE_STATE）"
+    exit 1
+fi
+
 # ---------- 生成构建期常量 ----------
-# 凭据与版本号写成 Go 源码里的字符串常量，这样 garble -literals 能加密它们；
-# 用 -ldflags -X 注入的字符串是明文躺在数据段的，达不到同样效果。
-USER_ENC="$(CGO_ENABLED=0 go run obfstr.go "$DAV_USER")"
-PASS_ENC="$(CGO_ENABLED=0 go run obfstr.go "$DAV_PASS")"
+# 只把只读分享 token / 口令和版本号写进生成文件；DAV 主账号密码不进入二进制。
+TOKEN_ENC="$(CGO_ENABLED=0 go run obfstr.go "$CG_SHARE_TOKEN")"
+SHARE_ENC="$(CGO_ENABLED=0 go run obfstr.go "$CG_SHARE_PASS")"
 
 SECRET_FILE="zz_build_secret.go"
+LAUNCHER_SECRET="launcher/zz_build_secret.go"
+LAUNCHER_RSRC="launcher/rsrc.syso"
 cat > "$SECRET_FILE" <<EOF
 //go:build cg_secret
 
 package main
 
-func buildToolVersion() string { return "${NEW}" }
-func buildCloudUser() string   { return deob("${USER_ENC}") }
-func buildCloudPass() string   { return deob("${PASS_ENC}") }
+func buildToolVersion() string    { return "${NEW}" }
+func buildCloudShareToken() string { return deob("${TOKEN_ENC}") }
+func buildCloudSharePass() string  { return deob("${SHARE_ENC}") }
 EOF
-cleanup() { rm -f "$SECRET_FILE"; }
+cat > "$LAUNCHER_SECRET" <<EOF
+//go:build cg_secret
+
+package main
+
+func buildShareToken() string { return deob("${TOKEN_ENC}") }
+func buildSharePass() string  { return deob("${SHARE_ENC}") }
+EOF
+cp rsrc.syso "$LAUNCHER_RSRC"
+cleanup() { rm -f "$SECRET_FILE" "$LAUNCHER_SECRET" "$LAUNCHER_RSRC"; }
 trap cleanup EXIT
 
 LDFLAGS="-s -w"
 DIST="../dist"
-mkdir -p "$DIST"
+CLOUD="${DIST}/cloud"
+mkdir -p "$DIST" "$CLOUD/app"
+# 旧版本遗留的独立主程序/CLI/测试启动器不再分发。
+rm -f "${DIST}/CG-app.exe" "${DIST}/CG-cli.exe" "${DIST}/CG-test.exe"
+rm -rf "${DIST}/app"
 
 # ---------- 编译器 ----------
 # 不用 garble：它会把依赖包（lxn/walk declarative）的未导出字段名一起混淆，
@@ -110,17 +141,56 @@ sha256() {
     fi
 }
 
-echo "==> 编译 CG.exe (windowsgui)"
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $BUILD_TOOL build -trimpath -tags cg_secret \
-    -ldflags "-H=windowsgui ${LDFLAGS}" -o "${DIST}/CG.exe" .
+md5_of() {
+    if command -v md5sum >/dev/null 2>&1; then
+        md5sum "$1" | cut -d' ' -f1
+    else
+        md5 -q "$1"
+    fi
+}
 
-echo "==> 编译 CG-cli.exe (console)"
+echo "==> 编译主程序（云端下发）"
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $BUILD_TOOL build -trimpath -tags cg_secret \
-    -ldflags "${LDFLAGS}" -o "${DIST}/CG-cli.exe" .
+    -ldflags "-H=windowsgui ${LDFLAGS}" -o "${CLOUD}/CG-app.exe" .
+
+echo "==> 编译 CG.exe (唯一分发启动器)"
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $BUILD_TOOL build -trimpath -tags cg_secret \
+    -ldflags "-H=windowsgui ${LDFLAGS}" -o "${DIST}/CG.exe" ./launcher
+
+echo "==> 生成云下发主程序包"
+APP_SHA="$(sha256 "${CLOUD}/CG-app.exe")"
+APP_MD5="$(md5_of "${CLOUD}/CG-app.exe")"
+APP_SIZE="$(wc -c < "${CLOUD}/CG-app.exe" | tr -d ' ')"
+APP_SIG="$(CGO_ENABLED=0 go run sign_update.go "$NEW" "$APP_SHA" "$APP_SIZE" 2>/dev/null || true)"
+if [ -z "$APP_SIG" ]; then
+    echo "错误: 主程序清单签名失败（检查 ${HOME}/.cg-keys/update.key）"
+    exit 1
+fi
+gzip -9 -n -c "${CLOUD}/CG-app.exe" > "${CLOUD}/app/CG-app.exe.gz"
+cat > "${CLOUD}/app/version.json" <<EOF
+{
+  "version": "${NEW}",
+  "file": "CG-app.exe.gz",
+  "sha256": "${APP_SHA}",
+  "md5": "${APP_MD5}",
+  "size": ${APP_SIZE},
+  "notes": "build $(date '+%Y-%m-%d %H:%M')",
+  "sig": "${APP_SIG}"
+}
+EOF
 
 echo "==> 校验内嵌资源"
-if command -v python3 >/dev/null 2>&1 && python3 -V >/dev/null 2>&1; then
-python3 - "$DIST/CG.exe" "$NEW" <<'PY'
+PYTHON_BIN="${PYTHON_BIN:-}"
+if [ -z "$PYTHON_BIN" ]; then
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" -V >/dev/null 2>&1; then
+            PYTHON_BIN="$c"
+            break
+        fi
+    done
+fi
+if [ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -V >/dev/null 2>&1; then
+"$PYTHON_BIN" - "$CLOUD/CG-app.exe" "$NEW" <<'PY'
 import sys
 path, ver = sys.argv[1], sys.argv[2]
 data = open(path, "rb").read()
@@ -131,11 +201,13 @@ checks = {
 }
 for name, needle in checks.items():
     print(f"    {name}: {'OK' if needle in data else '缺失'}")
-print(f"    大小: {len(data)/1024/1024:.1f} MB")
+print(f"    主程序大小: {len(data)/1024/1024:.1f} MB")
 PY
 else
-    echo "    跳过（本机 python3 不可用）"
+    echo "    跳过（本机 python 不可用）"
 fi
+echo "    启动器大小: $(($(wc -c < "${DIST}/CG.exe")/1024)) KB"
+echo "    云下发压缩包: $(($(wc -c < "${CLOUD}/app/CG-app.exe.gz")/1024)) KB"
 
 BASE="https://cloud.51i.cc/remote.php/dav/files/leonai"
 AUTH="${DAV_USER}:${DAV_PASS}"
@@ -198,18 +270,40 @@ if [ "$PUBLISH" = "1" ]; then
     SHA="$(sha256 "${DIST}/CG.exe")"
     SIZE="$(wc -c < "${DIST}/CG.exe" | tr -d ' ')"
 
-    SIG=""
-    if [ -f "${HOME}/.cg-keys/update.key" ]; then
-        SIG="$(CGO_ENABLED=0 go run sign_update.go "$NEW" "$SHA" "$SIZE" 2>/dev/null || true)"
+    REMOTE_JSON="$(mktemp)"
+    REMOTE_SHA=""
+    if curl -fsS -u "$AUTH" -o "$REMOTE_JSON" "${BASE}/CG/update/version.json" >/dev/null 2>&1; then
+        if [ -n "${PYTHON_BIN:-}" ] && "$PYTHON_BIN" -V >/dev/null 2>&1; then
+            REMOTE_SHA="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("sha256",""))' "$REMOTE_JSON" 2>/dev/null || true)"
+        else
+            REMOTE_SHA="$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REMOTE_JSON" | head -1)"
+        fi
     fi
-    if [ -z "$SIG" ]; then
-        echo "错误: 没能生成更新签名（检查 ${HOME}/.cg-keys/update.key）"
-        echo "      缺私钥时发布会生成无签名清单，所有客户端都会拒绝更新。"
-        exit 1
-    fi
+    rm -f "$REMOTE_JSON"
 
-    JSON="$(mktemp)"
-    cat > "$JSON" <<EOF
+    echo "==> 上传 CG/app/CG-app.exe.gz ($(($(wc -c < "${CLOUD}/app/CG-app.exe.gz")/1024)) KB)"
+    curl -sS -u "$AUTH" -X MKCOL "${BASE}/CG/app/" >/dev/null || true
+    curl -sS -u "$AUTH" -T "${CLOUD}/app/CG-app.exe.gz" "${BASE}/CG/app/CG-app.exe.gz" >/dev/null
+    echo "==> 上传 CG/app/version.json（已签名，MD5 ${APP_MD5:0:12}...）"
+    curl -sS -u "$AUTH" -T "${CLOUD}/app/version.json" "${BASE}/CG/app/version.json" >/dev/null
+
+    LAUNCH_UPLOADED=1
+    if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$SHA" ]; then
+        echo "==> 分发包未变化，跳过 CG/update 上传"
+        LAUNCH_UPLOADED=0
+    else
+        SIG=""
+        if [ -f "${HOME}/.cg-keys/update.key" ]; then
+            SIG="$(CGO_ENABLED=0 go run sign_update.go "$NEW" "$SHA" "$SIZE" 2>/dev/null || true)"
+        fi
+        if [ -z "$SIG" ]; then
+            echo "错误: 没能生成更新签名（检查 ${HOME}/.cg-keys/update.key）"
+            echo "      缺私钥时发布会生成无签名清单，所有客户端都会拒绝更新。"
+            exit 1
+        fi
+
+        JSON="$(mktemp)"
+        cat > "$JSON" <<EOF
 {
   "version": "${NEW}",
   "file": "CG.exe",
@@ -220,13 +314,17 @@ if [ "$PUBLISH" = "1" ]; then
 }
 EOF
 
-    echo "==> 上传 CG/update/CG.exe"
-    curl -sS -u "$AUTH" -X MKCOL "${BASE}/CG/update/" >/dev/null || true
-    curl -sS -u "$AUTH" -T "${DIST}/CG.exe" "${BASE}/CG/update/CG.exe" >/dev/null
-    echo "==> 上传 CG/update/version.json（已签名）"
-    curl -sS -u "$AUTH" -T "$JSON" "${BASE}/CG/update/version.json" >/dev/null
-    rm -f "$JSON"
-    echo "==> 已发布 v${NEW}（sha256 ${SHA:0:12}...）"
+        # 旧版客户端仍从 CG/update 自更新：这里放启动器，完成到新架构的迁移。
+        echo "==> 上传 CG/update/CG.exe（启动器）"
+        curl -sS -u "$AUTH" -X MKCOL "${BASE}/CG/update/" >/dev/null || true
+        curl -sS -u "$AUTH" -T "${DIST}/CG.exe" "${BASE}/CG/update/CG.exe" >/dev/null
+        echo "==> 上传 CG/update/version.json（已签名）"
+        curl -sS -u "$AUTH" -T "$JSON" "${BASE}/CG/update/version.json" >/dev/null
+        rm -f "$JSON"
+    fi
+    rm -rf "$CLOUD"
+    echo "==> 已发布 v${NEW}（主程序 ${APP_SHA:0:12}... / 分发包更新=${LAUNCH_UPLOADED}）"
 fi
 
-echo "==> 完成: ${DIST}/CG.exe v${NEW}"
+echo "==> 完成: v${NEW}"
+echo "    唯一分发文件: ${DIST}/CG.exe"
