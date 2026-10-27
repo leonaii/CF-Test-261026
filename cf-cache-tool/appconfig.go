@@ -43,6 +43,7 @@ func markLabel(id string) string {
 type appConfig struct {
 	Profile   string            `json:"profile"`
 	WorkDir   string            `json:"work_dir"`
+	GameDir   string            `json:"game_dir,omitempty"` // 自研上号：用户选过的游戏目录
 	CloudName string            `json:"cloud_name"`
 	AutoCloud  bool              `json:"auto_cloud"`
 	ProxyOn    *bool             `json:"proxy_on,omitempty"`    // nil = 默认开启

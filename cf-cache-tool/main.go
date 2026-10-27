@@ -64,6 +64,10 @@ func main() {
 			usage()
 			os.Exit(2)
 		}
+		// 退出前清掉为绕过 2310 写进游戏目录的伪造文件
+		if n := selfCleanupRailArtifacts(); n > 0 {
+			fmt.Printf("已清理 rail 残留文件 %d 个\n", n)
+		}
 		// 更新完成：界面已退出，这里拉起新版本
 		restartIfNeeded()
 		return
@@ -565,6 +569,10 @@ func cmdClean() error {
 		for _, f := range left {
 			logf("删除失败（可能仍在运行）: %s", f)
 		}
+	}
+	if n := selfCleanupRailArtifacts(); n > 0 {
+		logf("已清理 rail 残留文件 %d 个", n)
+		total += n
 	}
 	if total == 0 {
 		logf("没有需要清理的文件")
