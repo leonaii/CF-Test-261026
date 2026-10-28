@@ -6,11 +6,12 @@
 #   ./build.sh --publish    自动 +1 并上传到云端更新目录
 #   ./build.sh 1.2.0 --publish
 #   ./build.sh --no-loader  跳过上号器资源同步（离线打包时用）
+#   ./build_launcher.sh     只重编译/发布 Rust 启动器，主程序不变
 #
 # 凭据：.build.env 里的 DAV_USER / DAV_PASS 只用于构建机上传和创建只读分享，
 #       不进入任何客户端二进制。客户端只拿只读分享 token / 口令。
 #
-# 产物：../dist/CG.exe（唯一对外分发的启动器）
+# 产物：../dist/CG.exe（唯一对外分发的启动器，Rust + UPX）
 #       ../dist/cloud/* 仅为本地上传暂存，不对外分发
 # 云端：CG/app/* 为新版主程序清单；CG/update/* 保留用于旧客户端迁移。
 
@@ -95,7 +96,6 @@ TOKEN_ENC="$(CGO_ENABLED=0 go run obfstr.go "$CG_SHARE_TOKEN")"
 SHARE_ENC="$(CGO_ENABLED=0 go run obfstr.go "$CG_SHARE_PASS")"
 
 SECRET_FILE="zz_build_secret.go"
-LAUNCHER_SECRET="launcher/zz_build_secret.go"
 LAUNCHER_RSRC="launcher/rsrc.syso"
 cat > "$SECRET_FILE" <<EOF
 //go:build cg_secret
@@ -106,16 +106,8 @@ func buildToolVersion() string    { return "${NEW}" }
 func buildCloudShareToken() string { return deob("${TOKEN_ENC}") }
 func buildCloudSharePass() string  { return deob("${SHARE_ENC}") }
 EOF
-cat > "$LAUNCHER_SECRET" <<EOF
-//go:build cg_secret
-
-package main
-
-func buildShareToken() string { return deob("${TOKEN_ENC}") }
-func buildSharePass() string  { return deob("${SHARE_ENC}") }
-EOF
 cp rsrc.syso "$LAUNCHER_RSRC"
-cleanup() { rm -f "$SECRET_FILE" "$LAUNCHER_SECRET" "$LAUNCHER_RSRC"; }
+cleanup() { rm -f "$SECRET_FILE" "$LAUNCHER_RSRC"; }
 trap cleanup EXIT
 
 LDFLAGS="-s -w"
@@ -149,13 +141,65 @@ md5_of() {
     fi
 }
 
+sha256_stdin() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -d' ' -f1
+    else
+        sha256sum | cut -d' ' -f1
+    fi
+}
+
+find_upx() {
+    if [ -n "${UPX_BIN:-}" ] && [ -x "$UPX_BIN" ]; then
+        printf '%s' "$UPX_BIN"
+        return 0
+    fi
+    if command -v upx >/dev/null 2>&1; then
+        command -v upx
+        return 0
+    fi
+    if command -v cygpath >/dev/null 2>&1 && [ -n "${LOCALAPPDATA:-}" ]; then
+        find "$(cygpath "$LOCALAPPDATA")/Microsoft/WinGet/Packages" -name upx.exe -type f 2>/dev/null | head -1
+        return 0
+    fi
+    return 0
+}
+
 echo "==> 编译主程序（云端下发）"
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $BUILD_TOOL build -trimpath -tags cg_secret \
     -ldflags "-H=windowsgui ${LDFLAGS}" -o "${CLOUD}/CG-app.exe" .
 
-echo "==> 编译 CG.exe (唯一分发启动器)"
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $BUILD_TOOL build -trimpath -tags cg_secret \
-    -ldflags "-H=windowsgui ${LDFLAGS}" -o "${DIST}/CG.exe" ./launcher
+echo "==> 编译 CG.exe (Rust + UPX)"
+(
+    cd launcher
+    export CG_SHARE_TOKEN CG_SHARE_PASS
+    export VCVARS64="${VCVARS64:-C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat}"
+    cmd.exe //c build.cmd
+)
+cp launcher/target/release/cg-launcher.exe "${DIST}/CG.exe"
+UPX="$(find_upx)"
+if [ -n "$UPX" ]; then
+    "$UPX" --best --lzma -q "${DIST}/CG.exe"
+    "$UPX" -t -q "${DIST}/CG.exe"
+fi
+if ! grep -aq "requireAdministrator" "${DIST}/CG.exe"; then
+    echo "错误: 启动器没有嵌入管理员清单"
+    exit 1
+fi
+
+# 分发包指纹只看真正影响启动器行为的输入，不受 PE 时间戳影响。
+TOOLCHAIN="$(rustc -Vv 2>/dev/null | tr '\n' ' ' || true)"
+SECRET_FP="$(printf '%s\n%s' "$CG_SHARE_TOKEN" "$CG_SHARE_PASS" | sha256_stdin)"
+LAUNCHER_FP="$(
+    {
+        printf '%s\n%s\n' "$TOOLCHAIN" "$SECRET_FP"
+        for f in launcher/Cargo.toml launcher/Cargo.lock launcher/build.rs launcher/build.cmd \
+                 launcher/src/main.rs launcher/src/crypto.rs launcher/src/cng.rs launcher/src/net.rs \
+                 launcher/src/gzip.rs rsrc.syso; do
+            sha256 "$f"
+        done
+    } | sha256_stdin
+)"
 
 echo "==> 生成云下发主程序包"
 APP_SHA="$(sha256 "${CLOUD}/CG-app.exe")"
@@ -164,6 +208,11 @@ APP_SIZE="$(wc -c < "${CLOUD}/CG-app.exe" | tr -d ' ')"
 APP_SIG="$(CGO_ENABLED=0 go run sign_update.go "$NEW" "$APP_SHA" "$APP_SIZE" 2>/dev/null || true)"
 if [ -z "$APP_SIG" ]; then
     echo "错误: 主程序清单签名失败（检查 ${HOME}/.cg-keys/update.key）"
+    exit 1
+fi
+APP_ECDSA="$(CGO_ENABLED=0 go run sign_update_ecdsa.go sign "$NEW" "$APP_SHA" "$APP_SIZE" 2>/dev/null || true)"
+if [ -z "$APP_ECDSA" ]; then
+    echo "错误: 主程序 ECDSA 签名失败（检查 ${HOME}/.cg-keys/launcher_ecdsa.key）"
     exit 1
 fi
 gzip -9 -n -c "${CLOUD}/CG-app.exe" > "${CLOUD}/app/CG-app.exe.gz"
@@ -175,7 +224,8 @@ cat > "${CLOUD}/app/version.json" <<EOF
   "md5": "${APP_MD5}",
   "size": ${APP_SIZE},
   "notes": "build $(date '+%Y-%m-%d %H:%M')",
-  "sig": "${APP_SIG}"
+  "sig": "${APP_SIG}",
+  "sig_ecdsa": "${APP_ECDSA}"
 }
 EOF
 
@@ -207,6 +257,7 @@ else
     echo "    跳过（本机 python 不可用）"
 fi
 echo "    启动器大小: $(($(wc -c < "${DIST}/CG.exe")/1024)) KB"
+echo "    分发包指纹: ${LAUNCHER_FP}"
 echo "    云下发压缩包: $(($(wc -c < "${CLOUD}/app/CG-app.exe.gz")/1024)) KB"
 
 BASE="https://cloud.51i.cc/remote.php/dav/files/leonai"
@@ -272,11 +323,17 @@ if [ "$PUBLISH" = "1" ]; then
 
     REMOTE_JSON="$(mktemp)"
     REMOTE_SHA=""
+    REMOTE_FP=""
+    REMOTE_SIZE=""
     if curl -fsS -u "$AUTH" -o "$REMOTE_JSON" "${BASE}/CG/update/version.json" >/dev/null 2>&1; then
         if [ -n "${PYTHON_BIN:-}" ] && "$PYTHON_BIN" -V >/dev/null 2>&1; then
             REMOTE_SHA="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("sha256",""))' "$REMOTE_JSON" 2>/dev/null || true)"
+            REMOTE_FP="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("launcher_fp",""))' "$REMOTE_JSON" 2>/dev/null || true)"
+            REMOTE_SIZE="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("size",0))' "$REMOTE_JSON" 2>/dev/null || true)"
         else
             REMOTE_SHA="$(sed -n 's/.*"sha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REMOTE_JSON" | head -1)"
+            REMOTE_FP="$(sed -n 's/.*"launcher_fp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REMOTE_JSON" | head -1)"
+            REMOTE_SIZE="$(sed -n 's/.*"size"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$REMOTE_JSON" | head -1)"
         fi
     fi
     rm -f "$REMOTE_JSON"
@@ -288,9 +345,35 @@ if [ "$PUBLISH" = "1" ]; then
     curl -sS -u "$AUTH" -T "${CLOUD}/app/version.json" "${BASE}/CG/app/version.json" >/dev/null
 
     LAUNCH_UPLOADED=1
-    if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$SHA" ]; then
-        echo "==> 分发包未变化，跳过 CG/update 上传"
+    if { [ -n "$REMOTE_FP" ] && [ "$REMOTE_FP" = "$LAUNCHER_FP" ]; } || \
+       { [ -z "$REMOTE_FP" ] && [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" = "$SHA" ]; }; then
+        echo "==> 分发包未变化，跳过 CG/update/CG.exe 上传（fp ${LAUNCHER_FP:0:12}...）"
         LAUNCH_UPLOADED=0
+        # 二进制不传，但仍用云端现有启动器的 hash/大小更新版本清单，旧客户端才能继续迁移。
+        SIG=""
+        if [ -f "${HOME}/.cg-keys/update.key" ]; then
+            SIG="$(CGO_ENABLED=0 go run sign_update.go "$NEW" "$REMOTE_SHA" "$REMOTE_SIZE" 2>/dev/null || true)"
+        fi
+        if [ -z "$SIG" ]; then
+            echo "错误: 分发包清单更新签名失败（检查 ${HOME}/.cg-keys/update.key）"
+            exit 1
+        fi
+        JSON="$(mktemp)"
+        cat > "$JSON" <<EOF
+{
+  "version": "${NEW}",
+  "file": "CG.exe",
+  "sha256": "${REMOTE_SHA}",
+  "size": ${REMOTE_SIZE},
+  "launcher_fp": "${LAUNCHER_FP}",
+  "notes": "build $(date '+%Y-%m-%d %H:%M')",
+  "sig": "${SIG}"
+}
+EOF
+        echo "==> 仅更新 CG/update/version.json"
+        curl -sS -u "$AUTH" -X MKCOL "${BASE}/CG/update/" >/dev/null || true
+        curl -sS -u "$AUTH" -T "$JSON" "${BASE}/CG/update/version.json" >/dev/null
+        rm -f "$JSON"
     else
         SIG=""
         if [ -f "${HOME}/.cg-keys/update.key" ]; then
@@ -309,6 +392,7 @@ if [ "$PUBLISH" = "1" ]; then
   "file": "CG.exe",
   "sha256": "${SHA}",
   "size": ${SIZE},
+  "launcher_fp": "${LAUNCHER_FP}",
   "notes": "build $(date '+%Y-%m-%d %H:%M')",
   "sig": "${SIG}"
 }
