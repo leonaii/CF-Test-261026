@@ -1,6 +1,5 @@
 # 构建期生成，含只读分享/构建凭据，不进仓库
 zz_build_secret.go
-launcher/zz_build_secret.go
 launcher/rsrc.syso
 .cg-share.env
 .build.env
@@ -8,3 +7,4 @@ launcher/rsrc.syso
 # 本地产物
 *.exe
 dist/
+launcher/target/
