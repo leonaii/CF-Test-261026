@@ -60,17 +60,21 @@ func main() {
 	var data shareData
 
 	if st.ID != "" {
-		if d, err := getShare(user, pass, st.ID); err == nil {
-			data = d
-			if st.Token == "" {
-				st.Token = d.Token
+		d, err := getShare(user, pass, st.ID)
+		if err != nil {
+			fail(fmt.Errorf("读取现有只读分享失败，拒绝自动更换口令: %w", err))
+		}
+		data = d
+		if d.Token != "" {
+			st.Token = d.Token
+		}
+		if st.Pass == "" {
+			st.Pass = newPassword()
+			if err := setShareField(user, pass, st.ID, "password", st.Pass); err != nil {
+				fail(fmt.Errorf("设置只读分享口令失败: %w", err))
 			}
-			if st.Pass == "" || !verifyPublic(st.Token, st.Pass) {
-				st.Pass = newPassword()
-				if err := setShareField(user, pass, st.ID, "password", st.Pass); err != nil {
-					fail(fmt.Errorf("重置只读分享口令失败: %w", err))
-				}
-			}
+		} else if !verifyPublic(st.Token, st.Pass) {
+			fail(errors.New("现有只读分享口令自检失败；为避免让已发布客户端失效，本次不自动轮换口令"))
 		}
 	}
 
@@ -191,8 +195,12 @@ func getShare(user, pass, id string) (shareData, error) {
 		return shareData{}, err
 	}
 	var d shareData
-	if err := json.Unmarshal(env.OCS.Data, &d); err != nil {
-		return shareData{}, err
+	if err := json.Unmarshal(env.OCS.Data, &d); err != nil || rawString(d.ID) == "" {
+		var list []shareData
+		if e := json.Unmarshal(env.OCS.Data, &list); e != nil || len(list) == 0 {
+			return shareData{}, errors.New("分享详情为空或格式错误")
+		}
+		d = list[0]
 	}
 	if rawString(d.ID) == "" {
 		return shareData{}, errors.New("分享详情为空")
