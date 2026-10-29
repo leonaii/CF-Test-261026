@@ -376,7 +376,20 @@ CG租号.exe（Rust 外壳，唯一对外分发的文件）
   → 分离 cmd 循环删除 .old；新外壳下次启动也会清 CG.exe.old
 ```
 
-### 6.4 主程序自更新（已停用）
+### 6.4 主程序启动校验（只允许外壳拉起）
+
+`zuhaoclient.exe` 双击打开会弹提示并退出，必须从 `CG租号.exe` 进：
+
+- 新外壳 spawn 主程序时带环境变量 `CG_VIA_LAUNCHER=1`（`launcher/src/main.rs`）
+- 旧 1.2.56 外壳没有这个标记，按父进程文件名兜底（`CG.exe` / `CG租号.exe`）；
+  它是 `cmd.Run` 等待子进程，检测时父进程一定还活着
+- 其它来源（资源管理器、cmd、指向 exe 的快捷方式）→ MessageBox
+  “请通过 CG租号.exe 启动游戏租号客户端。”后退出
+- **带参数运行不校验**：`push` / `pull` / `gs` 等命令行照常可用
+- `gui_windows.go` 里 `restartIfNeeded` 自重启（切换卡密）也要显式带上标记，
+  否则重启出来的进程会被自己的校验拦下
+
+### 6.5 主程序自更新（已停用）
 
 `CG/update/version.json` 字段变化只影响外壳；主程序清单是 `CG/app/version.json`：
 
