@@ -56,6 +56,10 @@ func main() {
 	_ = os.Remove(filepath.Join(configDirPath(), "startup.log"))
 	cleanupLoaderCache()
 	if len(os.Args) < 2 {
+		// 只允许外壳（CG租号.exe）拉起，双击 zuhaoclient.exe 直接提示并退出
+		if !requireShell() {
+			return
+		}
 		// 单实例：已经开了一个就不再开第二个
 		if !ensureSingleInstance() {
 			warnAlreadyRunning()

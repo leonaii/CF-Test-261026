@@ -1167,8 +1167,11 @@ func restartIfNeeded() {
 	}
 	pendingRestart.Store("")
 
+	// 自重启也要带上“由外壳拉起”的标记，否则会被启动校验拦下来
+	childEnv := append(os.Environ(), viaLauncherEnv+"=1")
 	cmd := exec.Command(exe)
 	cmd.Dir = filepath.Dir(exe)
+	cmd.Env = childEnv
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000008} // DETACHED_PROCESS
 	if err := cmd.Start(); err == nil {
 		_ = cmd.Process.Release()
@@ -1177,6 +1180,7 @@ func restartIfNeeded() {
 
 	// 兜底：交给 shell 启动（CmdLine 原样传入，不经 exec 的引号转义）
 	c := exec.Command("cmd")
+	c.Env = childEnv
 	c.SysProcAttr = &syscall.SysProcAttr{
 		CmdLine:       `cmd /c start "" "` + exe + `"`,
 		HideWindow:    true,

@@ -162,8 +162,10 @@ fn run() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or(selected);
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // 主程序只认外壳拉起：带上标记，否则双击 zuhaoclient.exe 会被拒绝
     Command::new(&selected)
         .args(args)
+        .env("CG_VIA_LAUNCHER", "1")
         .spawn()
         .map_err(|e| format!("启动主程序失败：{e}"))?;
     Ok(())
