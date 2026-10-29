@@ -61,6 +61,9 @@ uninstall.go         卸载本地数据（按名单删 / 整目录强删）
 uninstall_windows.go 枚举并结束占用目录的进程
 cleanup_windows.go   退出后延迟删除 CG.exe.old
 build.sh             打包脚本（版本自增、编译、资源同步、发布）
+build_launcher.sh    只重建/发布 Rust 启动器
+build_resources.go   生成 rsrc.syso（管理员清单 + 兜底图标/版本，依赖 go-winres）
+stamp_exe.go         复制参考 exe 的图标/版本信息/数字签名/文件时间（构建期）
 version.txt          当前版本号
 ```
 
@@ -293,6 +296,33 @@ cd cf-cache-tool
 - `toolVersion` 必须是 `var`，写成 `const` 会让 ldflags 失效
 - 产物：`dist/CG.exe`（`-H=windowsgui -s -w -trimpath`）、`dist/CG-cli.exe`
 
+启动器外观从 `exe/zuhaoclient.exe`（GG租号，EV 签名有效）复制，顺序不能换：
+
+```text
+链接 → go run stamp_exe.go -icon -version → UPX → go run stamp_exe.go -sig -time
+```
+
+- 图标与版本信息用 `UpdateResource` 整块替换参考 exe 的资源，**必须在 UPX 之前**：
+  先压缩再改 .rsrc 会破坏 UPX 的节布局
+- 签名是把参考 exe 的 PE 证书表搬到文件尾并改写 DataDirectory[4]，**只能在最后**：
+  之后任何写文件操作都会让签名内容与哈希彻底对不上（本来也是 HashMismatch）
+- 搬过来的签名没有目标文件哈希，验证结果是 `HashMismatch`，但证书主体/序列号/时间戳
+  与参考一致，属性页能看到“湖南南澳网络科技有限公司”
+- 修改时间也要放在最后设置，`writeChecksum` 会重写整个文件、把 mtime 刷成当前时间
+- 参考 exe 缺失时脚本打印“跳过”，产物退回 `build_resources.go` 的兜底图标/版本
+- **窗口图标**：walk 注册窗口类时写死 `LoadIcon(hInst, 7)`，参考程序的图标组 ID 是 133，
+  只搬 133 会让标题栏 / 任务栏 / Alt-Tab 退回系统通用图标。`stamp_exe.go` 会额外补一份
+  同内容的 ID 7 图标组（`windowIconID`），资源管理器仍按原 ID 133 显示
+
+单独给任意 exe 刷外观：
+
+```bash
+go run stamp_exe.go -from 参考.exe -to 目标.exe            # 四项全复制
+go run stamp_exe.go -from 参考.exe -to 目标.exe -icon -version
+go run stamp_exe.go -dump 参考.exe                        # 先看参考文件里有什么
+go run stamp_exe.go -list 参考.exe                        # 列出资源类型/ID/语言
+```
+
 **链接器会删死代码**：没被引用的函数连同字符串常量一起消失，功能会“静默失效”。
 曾因漏写 `go a.checkUpdate()` 导致整个更新模块被优化掉。所以脚本里有一道字符串校验，
 新增功能后建议补检查项：
@@ -305,29 +335,61 @@ python3 -c "d=open('../dist/CG.exe','rb').read(); print('关键字'.encode() in 
 
 ## 6. 自动更新
 
-清单 `CG/update/version.json`：
-
-```json
-{ "version": "1.0.25", "file": "CG.exe", "sha256": "...", "size": 12011008, "notes": "build ..." }
-```
+### 6.1 两级结构
 
 ```text
-启动（第一界面之前就开始，后台）→ GET 清单
-  → 版本不新：结束
-  → 有新版本：下载到 CG.update.tmp → 校验大小 + sha256
-       → CG.exe 改名 CG.exe.old → 新文件就位 → 记录“本进程已更新到 vX”
-  → 不在录制/回放时：关闭窗口 → main() 里拉起新版本
+CG租号.exe（Rust 外壳，唯一对外分发的文件）
+  ├─ 自更新：GET CG/update/version.json → 下载 CG/update/CG.exe → 换掉自己
+  └─ 主程序：GET CG/app/version.json → 下载 CG-app.exe.gz → 解压成
+             %AppData%\CG\zuhaoclient.exe → 启动
+
+主程序自己不再自更新（update.go 的 checkUpdateCore 直接 return），
+旧 1.2.56 客户端的外壳叫 CG.exe，没有自更新代码，由主程序启动时替换。
+```
+
+两个清单都带 `sig`（ed25519，给旧 Go 客户端）和 `sig_ecdsa`（P-256，给 Rust 外壳）：
+外壳校验 `version\nsha256\nsize` 的 ECDSA 签名，缺签名一律不更新。
+
+### 6.2 外壳自更新与改名（launcher/src/main.rs）
+
+```text
+启动 → 若自己叫 CG.exe：先改名成 CG租号.exe（运行中的 exe 可以改名）
+     → GET update/version.json，比 LAUNCHER_VERSION（构建时注入 version.txt）
+     → 有新版本：下载 .CG-launcher-update.tmp → 校验大小/sha256/ECDSA
+     → 自己改名 CG租号.exe.old → 新文件就位 → 拉起新外壳 → 本进程退出
+```
+
+- 版本号由 `build.rs` 读环境变量 `CG_LAUNCHER_VERSION` 写进 `secret.rs`，
+  `build.sh` / `build_launcher.sh` 编译前 export；`LAUNCHER_FP` 也算上了版本号，
+  版本变了就一定会上传新外壳（否则云端版本号新、二进制旧，客户端会无限循环更新）
+- 桌面快捷方式指向 CG.exe 的，改名后失效，需要用户重新双击 CG租号.exe
+
+### 6.3 旧外壳迁移（launchermigrate_windows.go）
+
+1.2.56 的外壳只下载主程序、等它退出，没有任何自更新代码，所以永远叫 CG.exe。
+主程序启动后：
+
+```text
+取父进程路径 → 名字是 CG.exe 且体积 > 1MB（旧 Go 外壳十几 MB，新外壳 200KB）
+  → 下载 CG/update/CG.exe（走只读分享，验 ed25519 清单 + 大小 + sha256）
+  → 同目录写 CG租号.exe → 把 CG.exe 改名 CG.exe.old（旧外壳正在运行，删不掉）
+  → 分离 cmd 循环删除 .old；新外壳下次启动也会清 CG.exe.old
+```
+
+### 6.4 主程序自更新（已停用）
+
+`CG/update/version.json` 字段变化只影响外壳；主程序清单是 `CG/app/version.json`：
+
+```json
+{ "version": "1.2.59", "file": "CG-app.exe.gz", "sha256": "...", "md5": "...", "size": 13602360,
+  "sig": "...", "sig_ecdsa": "..." }
 ```
 
 必须知道的约束：
 
-- **运行中的 exe 不能删、不能覆盖，只能改名**，所以更新当次一定存在 `CG.exe.old`
-- `.old` 在下次启动清理：先删一次 → 失败每 1.5s 重试（15s）→ 仍失败则起分离 cmd，
-  `ping -n 4` 后 `del /f /q`（本进程退出后由系统删除）
-- `applyUpdate` 只用固定名 `.old`，**删不掉就跳过本次更新**，绝不生成第二个文件
-- 首配窗口与主界面都会检查，用互斥锁 + `updateApplied` 保证**只下载一次**
-- 重启走 `main()`：`runGUI()` 返回后 `restartIfNeeded()` 用 `CreateProcess`（DETACHED_PROCESS）拉起，
-  不经过 `cmd`，避免引号转义
+- **运行中的 exe 不能删、不能覆盖，只能改名**，所以更新当次一定存在 `*.old`
+- 主程序由外壳写 `%AppData%\CG\zuhaoclient.exe`，旧名字 `CG-app.exe` / `CG.exe` 会被清掉
+- 外壳更新只认 `CG/update/CG.exe` 这个名字（1.2.56 客户端硬编码），本地落地名才叫 CG租号.exe
 
 ---
 
