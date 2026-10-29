@@ -83,11 +83,11 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 
 	d := Dialog{
 		AssignTo: &dlg,
-		Title:    "CG",
+		Title:    "游戏租号客户端",
 		Size:     Size{Width: 560, Height: 330},
 		Layout:   VBox{},
 		Children: []Widget{
-			Label{Text: "CG租号", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 24, Bold: true}},
+			Label{Text: "游戏租号客户端", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 24, Bold: true}},
 			VSpacer{Size: 10},
 
 			Label{Text: "上号器类型", TextColor: dim, Font: Font{PointSize: 9}},
@@ -224,7 +224,7 @@ func runMarkDialog(owner walk.Form, row accountRow, current string) (string, boo
 
 	d := Dialog{
 		AssignTo: &dlg,
-		Title:    "CG",
+		Title:    "游戏租号客户端",
 		Size:     Size{Width: 430, Height: 290},
 		Layout:   VBox{},
 		Children: []Widget{

@@ -151,7 +151,7 @@ func (a *guiApp) ymmPage() Widget {
 			Layout: HBox{Spacing: 8},
 			Children: []Widget{
 				Label{
-					Text:      "CG租号",
+					Text:      "游戏租号客户端",
 					TextColor: walk.RGB(24, 96, 186),
 					Font:      Font{Family: "Microsoft YaHei", PointSize: 14, Bold: true},
 				},

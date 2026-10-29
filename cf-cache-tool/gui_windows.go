@@ -196,7 +196,7 @@ func runGUI() (err error) {
 	runtime.LockOSThread()
 	defer func() {
 		if r := recover(); r != nil {
-			walk.MsgBox(nil, "CG 启动失败", fmt.Sprintf("%v", r), walk.MsgBoxIconError)
+			walk.MsgBox(nil, "游戏租号客户端", fmt.Sprintf("%v", r), walk.MsgBoxIconError)
 			err = fmt.Errorf("%v", r)
 		}
 	}()
@@ -262,7 +262,7 @@ func runGUI() (err error) {
 
 	a := &guiApp{cfg: cfg, firstRun: firstRun}
 	if e := a.init(); e != nil {
-		walk.MsgBox(nil, "CG 启动失败", e.Error(), walk.MsgBoxIconError)
+		walk.MsgBox(nil, "游戏租号客户端", e.Error(), walk.MsgBoxIconError)
 		return e
 	}
 	a.mw.Run()
@@ -381,7 +381,7 @@ func (a *guiApp) createWindow() error {
 		Composite{
 			Layout: HBox{Spacing: 10},
 			Children: []Widget{
-				Label{AssignTo: &a.headLabel, Text: "CG租号", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 18, Bold: true}},
+				Label{AssignTo: &a.headLabel, Text: "游戏租号客户端", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 18, Bold: true}},
 				Label{AssignTo: &a.headSub, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
 				HSpacer{},
 				Label{AssignTo: &a.verLabel, Text: "v" + toolVersion, TextColor: walk.RGB(150, 150, 150), Font: Font{PointSize: 8}},
@@ -451,7 +451,7 @@ func (a *guiApp) createWindow() error {
 
 	if err := (MainWindow{
 		AssignTo: &a.mw,
-		Title:    "CG租号",
+		Title:    "游戏租号客户端",
 		Size:     winSize,
 		Layout:   VBox{},
 		Children: []Widget{body},
@@ -475,6 +475,8 @@ func (a *guiApp) createWindow() error {
 	a.ymm.updateProxyStatus()
 	go a.proxyStatusLoop()
 	a.ymm.refresh()
+	// 1.2.56 的 CG.exe 外壳没有自更新，由主程序在后台换成 CG租号.exe
+	go migrateLegacyLauncher(a.logf)
 	return nil
 }
 

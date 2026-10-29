@@ -102,7 +102,7 @@ func main() {
 	case "clean":
 		err = cmdClean()
 	case "version", "-v", "--version":
-		fmt.Println("CG", toolVersion)
+		fmt.Println("游戏租号客户端", toolVersion)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -557,7 +557,7 @@ func cmdClean() error {
 	}
 	dir := filepath.Dir(exe)
 	total := 0
-	for _, base := range []string{"CG.exe", "CG-cli.exe"} {
+	for _, base := range []string{"zuhaoclient.exe", "CG.exe", "CG-cli.exe"} {
 		p := filepath.Join(dir, base)
 		before := 0
 		if matches, _ := filepath.Glob(p + ".old*"); len(matches) > 0 {

@@ -33,11 +33,11 @@ func runDirectLaunch(cfg *appConfig, card string) error {
 
 	decl := MainWindow{
 		AssignTo: &mw,
-		Title:    "CG租号 · 上号中",
+		Title:    "游戏租号客户端 · 上号中",
 		Size:     Size{Width: 460, Height: 170},
 		Layout:   VBox{},
 		Children: []Widget{
-			Label{Text: "CG租号", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 14, Bold: true}},
+			Label{Text: "游戏租号客户端", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 14, Bold: true}},
 			Label{AssignTo: &status, Text: "准备中…", Font: Font{PointSize: 10}},
 			Label{AssignTo: &detail, Text: card, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
 			VSpacer{},

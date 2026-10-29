@@ -59,7 +59,7 @@ func ensureSingleInstance() bool {
 
 // warnAlreadyRunning 第二个实例的提示。
 func warnAlreadyRunning() {
-	walk.MsgBox(nil, "CG租号",
+	walk.MsgBox(nil, "游戏租号客户端",
 		"软件已经在运行了，不要重复打开。\n\n请切到已打开的窗口。",
 		walk.MsgBoxIconInformation)
 }
