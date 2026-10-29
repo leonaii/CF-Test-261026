@@ -11,6 +11,20 @@
 # 凭据：.build.env 里的 DAV_USER / DAV_PASS 只用于构建机上传和创建只读分享，
 #       不进入任何客户端二进制。客户端只拿只读分享 token / 口令。
 #
+# ============================ 外观复制顺序（不可调换） ============================
+# 参考文件：exe/zuhaoclient.exe（GG租号，EV 签名有效），工具：stamp_exe.go
+#
+#   启动器：链接 → -icon -version → UPX → -sig -time
+#   主程序：go build → 四项一次写完 → 算 sha256/md5/大小 → 签名清单 → gzip
+#
+# 1) 图标/版本信息走 UpdateResource，会重写 .rsrc，必须在 UPX 之前；先压缩再改会
+#    破坏 UPX 的节布局。
+# 2) 签名是往文件尾追加 PE 证书表并改写 DataDirectory[4]，之后任何写文件都会让
+#    内容与签名彻底不符，只能放最后。
+# 3) 主程序的签名会改变文件内容，必须在算 sha256 之前写，否则清单校验必失败。
+# 4) 文件时间要排在 writeChecksum 之后，写文件会把 mtime 刷成当前时间。
+# =================================================================================
+#
 # 产物：../dist/CG.exe（唯一对外分发的启动器，Rust + UPX）
 #       ../dist/cloud/* 仅为本地上传暂存，不对外分发
 # 云端：CG/app/* 为新版主程序清单；CG/update/* 保留用于旧客户端迁移。
@@ -40,7 +54,7 @@ for arg in "$@"; do
     case "$arg" in
         --publish) PUBLISH=1 ;;
         --no-loader) SYNC_LOADER=0 ;;
-        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
         *) NEW="$arg" ;;
     esac
 done
@@ -106,7 +120,6 @@ func buildToolVersion() string    { return "${NEW}" }
 func buildCloudShareToken() string { return deob("${TOKEN_ENC}") }
 func buildCloudSharePass() string  { return deob("${SHARE_ENC}") }
 EOF
-cp rsrc.syso "$LAUNCHER_RSRC"
 cleanup() { rm -f "$SECRET_FILE" "$LAUNCHER_RSRC"; }
 trap cleanup EXIT
 
@@ -115,7 +128,7 @@ DIST="../dist"
 CLOUD="${DIST}/cloud"
 mkdir -p "$DIST" "$CLOUD/app"
 # 旧版本遗留的独立主程序/CLI/测试启动器不再分发。
-rm -f "${DIST}/CG-app.exe" "${DIST}/CG-cli.exe" "${DIST}/CG-test.exe"
+rm -f "${DIST}/CG-app.exe" "${DIST}/CG-cli.exe" "${DIST}/CG-test.exe" "${DIST}/CG.exe"
 rm -rf "${DIST}/app"
 
 # ---------- 编译器 ----------
@@ -123,6 +136,18 @@ rm -rf "${DIST}/app"
 # 而 declarative 靠反射按字段名赋值，混淆后启动即 panic（实测 v0.18.0）。
 # 凭据改用 obfstr.go 的 base64+XOR 混淆，strings 同样搜不到明文。
 BUILD_TOOL="go"
+
+find_python() {
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" -V >/dev/null 2>&1; then
+            command -v "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+# Python 只用于可选的字符串自检；资源生成已改成 Go，不再强制依赖
+PYTHON_BIN="${PYTHON_BIN:-$(find_python || true)}"
 
 # macOS 只有 shasum，Git Bash/Linux 只有 sha256sum
 sha256() {
@@ -165,24 +190,53 @@ find_upx() {
     return 0
 }
 
+echo "==> 生成图标/版本资源"
+CGO_ENABLED=0 go run build_resources.go "$NEW"
+
 echo "==> 编译主程序（云端下发）"
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $BUILD_TOOL build -trimpath -tags cg_secret \
-    -ldflags "-H=windowsgui ${LDFLAGS}" -o "${CLOUD}/CG-app.exe" .
+    -ldflags "-H=windowsgui ${LDFLAGS}" -o "${CLOUD}/zuhaoclient.exe" .
 
-echo "==> 编译 CG.exe (Rust + UPX)"
+# 参考 exe：图标 / 版本信息 / 数字签名 / 文件时间都从这里复制
+DONOR="exe/zuhaoclient.exe"
+
+# 主程序不经过 UPX，四项一次写完；必须在算 sha256 之前，签名会影响文件内容
+if [ -f "$DONOR" ]; then
+    echo "==> 复制图标/版本信息/签名/时间（主程序）"
+    CGO_ENABLED=0 go run stamp_exe.go -from "$DONOR" -to "${CLOUD}/zuhaoclient.exe"
+else
+    echo "==> 跳过外观复制：缺少 $DONOR"
+fi
+
+echo "==> 编译 CG租号.exe (Rust + UPX)"
 (
     cd launcher
-    export CG_SHARE_TOKEN CG_SHARE_PASS
+    export CG_SHARE_TOKEN CG_SHARE_PASS CG_LAUNCHER_VERSION="$NEW"
     export VCVARS64="${VCVARS64:-C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat}"
     cmd.exe //c build.cmd
 )
-cp launcher/target/release/cg-launcher.exe "${DIST}/CG.exe"
+cp launcher/target/release/cg-launcher.exe "${DIST}/CG租号.exe"
+
+# 图标 / 版本信息必须在 UPX 之前写入：UpdateResource 会重写 .rsrc，
+# 先压缩再改会破坏 UPX 的节布局。签名只能放在最后（追加到文件尾）。
+if [ -f "$DONOR" ]; then
+    echo "==> 复制图标/版本信息（参考 $(basename "$DONOR")）"
+    CGO_ENABLED=0 go run stamp_exe.go -from "$DONOR" -to "${DIST}/CG租号.exe" -icon -version
+else
+    echo "==> 跳过图标/版本复制：缺少 $DONOR"
+fi
+
 UPX="$(find_upx)"
 if [ -n "$UPX" ]; then
-    "$UPX" --best --lzma -q "${DIST}/CG.exe"
-    "$UPX" -t -q "${DIST}/CG.exe"
+    "$UPX" --best --lzma -q "${DIST}/CG租号.exe"
+    "$UPX" -t -q "${DIST}/CG租号.exe"
 fi
-if ! grep -aq "requireAdministrator" "${DIST}/CG.exe"; then
+
+if [ -f "$DONOR" ]; then
+    echo "==> 复制数字签名/修改时间"
+    CGO_ENABLED=0 go run stamp_exe.go -from "$DONOR" -to "${DIST}/CG租号.exe" -sig -time
+fi
+if ! grep -aq "requireAdministrator" "${DIST}/CG租号.exe"; then
     echo "错误: 启动器没有嵌入管理员清单"
     exit 1
 fi
@@ -192,19 +246,20 @@ TOOLCHAIN="$(rustc -Vv 2>/dev/null | tr '\n' ' ' || true)"
 SECRET_FP="$(printf '%s\n%s' "$CG_SHARE_TOKEN" "$CG_SHARE_PASS" | sha256_stdin)"
 LAUNCHER_FP="$(
     {
-        printf '%s\n%s\n' "$TOOLCHAIN" "$SECRET_FP"
+        printf '%s\n%s\n%s\n' "$TOOLCHAIN" "$SECRET_FP" "$NEW"
         for f in launcher/Cargo.toml launcher/Cargo.lock launcher/build.rs launcher/build.cmd \
                  launcher/src/main.rs launcher/src/crypto.rs launcher/src/cng.rs launcher/src/net.rs \
-                 launcher/src/gzip.rs rsrc.syso; do
+                 launcher/src/gzip.rs build_resources.go stamp_exe.go exe/zuhaoclient.exe assets/zuhaoclient.ico \
+                 assets/icon_256.png assets/icon_64.png assets/icon_48.png; do
             sha256 "$f"
         done
     } | sha256_stdin
 )"
 
 echo "==> 生成云下发主程序包"
-APP_SHA="$(sha256 "${CLOUD}/CG-app.exe")"
-APP_MD5="$(md5_of "${CLOUD}/CG-app.exe")"
-APP_SIZE="$(wc -c < "${CLOUD}/CG-app.exe" | tr -d ' ')"
+APP_SHA="$(sha256 "${CLOUD}/zuhaoclient.exe")"
+APP_MD5="$(md5_of "${CLOUD}/zuhaoclient.exe")"
+APP_SIZE="$(wc -c < "${CLOUD}/zuhaoclient.exe" | tr -d ' ')"
 APP_SIG="$(CGO_ENABLED=0 go run sign_update.go "$NEW" "$APP_SHA" "$APP_SIZE" 2>/dev/null || true)"
 if [ -z "$APP_SIG" ]; then
     echo "错误: 主程序清单签名失败（检查 ${HOME}/.cg-keys/update.key）"
@@ -215,7 +270,7 @@ if [ -z "$APP_ECDSA" ]; then
     echo "错误: 主程序 ECDSA 签名失败（检查 ${HOME}/.cg-keys/launcher_ecdsa.key）"
     exit 1
 fi
-gzip -9 -n -c "${CLOUD}/CG-app.exe" > "${CLOUD}/app/CG-app.exe.gz"
+gzip -9 -n -c "${CLOUD}/zuhaoclient.exe" > "${CLOUD}/app/CG-app.exe.gz"
 cat > "${CLOUD}/app/version.json" <<EOF
 {
   "version": "${NEW}",
@@ -230,33 +285,18 @@ cat > "${CLOUD}/app/version.json" <<EOF
 EOF
 
 echo "==> 校验内嵌资源"
-PYTHON_BIN="${PYTHON_BIN:-}"
-if [ -z "$PYTHON_BIN" ]; then
-    for c in python3 python; do
-        if command -v "$c" >/dev/null 2>&1 && "$c" -V >/dev/null 2>&1; then
-            PYTHON_BIN="$c"
-            break
-        fi
-    done
-fi
-if [ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -V >/dev/null 2>&1; then
-"$PYTHON_BIN" - "$CLOUD/CG-app.exe" "$NEW" <<'PY'
-import sys
-path, ver = sys.argv[1], sys.argv[2]
-data = open(path, "rb").read()
-checks = {
-    "版本号": ver.encode(),
-    "品牌": "CG租号".encode(),
-    "上号器类型": "圆梦上号器".encode(),
+check_str() {
+    if grep -aq -- "$2" "$1"; then
+        echo "    $3: OK"
+    else
+        echo "    $3: 缺失"
+    fi
 }
-for name, needle in checks.items():
-    print(f"    {name}: {'OK' if needle in data else '缺失'}")
-print(f"    主程序大小: {len(data)/1024/1024:.1f} MB")
-PY
-else
-    echo "    跳过（本机 python 不可用）"
-fi
-echo "    启动器大小: $(($(wc -c < "${DIST}/CG.exe")/1024)) KB"
+check_str "${CLOUD}/zuhaoclient.exe" "$NEW" "版本号"
+check_str "${CLOUD}/zuhaoclient.exe" "游戏租号客户端" "品牌"
+check_str "${CLOUD}/zuhaoclient.exe" "圆梦上号器" "上号器类型"
+echo "    主程序大小: $(awk "BEGIN{printf \"%.1f\", $(wc -c < "${CLOUD}/zuhaoclient.exe")/1048576}") MB"
+echo "    启动器大小: $(($(wc -c < "${DIST}/CG租号.exe")/1024)) KB"
 echo "    分发包指纹: ${LAUNCHER_FP}"
 echo "    云下发压缩包: $(($(wc -c < "${CLOUD}/app/CG-app.exe.gz")/1024)) KB"
 
@@ -318,8 +358,8 @@ if [ "$SYNC_LOADER" = "1" ]; then
 fi
 
 if [ "$PUBLISH" = "1" ]; then
-    SHA="$(sha256 "${DIST}/CG.exe")"
-    SIZE="$(wc -c < "${DIST}/CG.exe" | tr -d ' ')"
+    SHA="$(sha256 "${DIST}/CG租号.exe")"
+    SIZE="$(wc -c < "${DIST}/CG租号.exe" | tr -d ' ')"
 
     REMOTE_JSON="$(mktemp)"
     REMOTE_SHA=""
@@ -351,11 +391,13 @@ if [ "$PUBLISH" = "1" ]; then
         LAUNCH_UPLOADED=0
         # 二进制不传，但仍用云端现有启动器的 hash/大小更新版本清单，旧客户端才能继续迁移。
         SIG=""
+        SIG_ECDSA=""
         if [ -f "${HOME}/.cg-keys/update.key" ]; then
             SIG="$(CGO_ENABLED=0 go run sign_update.go "$NEW" "$REMOTE_SHA" "$REMOTE_SIZE" 2>/dev/null || true)"
         fi
-        if [ -z "$SIG" ]; then
-            echo "错误: 分发包清单更新签名失败（检查 ${HOME}/.cg-keys/update.key）"
+        SIG_ECDSA="$(CGO_ENABLED=0 go run sign_update_ecdsa.go sign "$NEW" "$REMOTE_SHA" "$REMOTE_SIZE" 2>/dev/null || true)"
+        if [ -z "$SIG" ] || [ -z "$SIG_ECDSA" ]; then
+            echo "错误: 分发包清单更新签名失败（检查 ${HOME}/.cg-keys/）"
             exit 1
         fi
         JSON="$(mktemp)"
@@ -367,7 +409,8 @@ if [ "$PUBLISH" = "1" ]; then
   "size": ${REMOTE_SIZE},
   "launcher_fp": "${LAUNCHER_FP}",
   "notes": "build $(date '+%Y-%m-%d %H:%M')",
-  "sig": "${SIG}"
+  "sig": "${SIG}",
+  "sig_ecdsa": "${SIG_ECDSA}"
 }
 EOF
         echo "==> 仅更新 CG/update/version.json"
@@ -376,11 +419,13 @@ EOF
         rm -f "$JSON"
     else
         SIG=""
+        SIG_ECDSA=""
         if [ -f "${HOME}/.cg-keys/update.key" ]; then
             SIG="$(CGO_ENABLED=0 go run sign_update.go "$NEW" "$SHA" "$SIZE" 2>/dev/null || true)"
         fi
-        if [ -z "$SIG" ]; then
-            echo "错误: 没能生成更新签名（检查 ${HOME}/.cg-keys/update.key）"
+        SIG_ECDSA="$(CGO_ENABLED=0 go run sign_update_ecdsa.go sign "$NEW" "$SHA" "$SIZE" 2>/dev/null || true)"
+        if [ -z "$SIG" ] || [ -z "$SIG_ECDSA" ]; then
+            echo "错误: 没能生成更新签名（检查 ${HOME}/.cg-keys/）"
             echo "      缺私钥时发布会生成无签名清单，所有客户端都会拒绝更新。"
             exit 1
         fi
@@ -394,14 +439,15 @@ EOF
   "size": ${SIZE},
   "launcher_fp": "${LAUNCHER_FP}",
   "notes": "build $(date '+%Y-%m-%d %H:%M')",
-  "sig": "${SIG}"
+  "sig": "${SIG}",
+  "sig_ecdsa": "${SIG_ECDSA}"
 }
 EOF
 
         # 旧版客户端仍从 CG/update 自更新：这里放启动器，完成到新架构的迁移。
         echo "==> 上传 CG/update/CG.exe（启动器）"
         curl -sS -u "$AUTH" -X MKCOL "${BASE}/CG/update/" >/dev/null || true
-        curl -sS -u "$AUTH" -T "${DIST}/CG.exe" "${BASE}/CG/update/CG.exe" >/dev/null
+        curl -sS -u "$AUTH" -T "${DIST}/CG租号.exe" "${BASE}/CG/update/CG.exe" >/dev/null
         echo "==> 上传 CG/update/version.json（已签名）"
         curl -sS -u "$AUTH" -T "$JSON" "${BASE}/CG/update/version.json" >/dev/null
         rm -f "$JSON"
@@ -411,4 +457,4 @@ EOF
 fi
 
 echo "==> 完成: v${NEW}"
-echo "    唯一分发文件: ${DIST}/CG.exe"
+echo "    唯一分发文件: ${DIST}/CG租号.exe"
