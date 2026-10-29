@@ -1,5 +1,6 @@
 # 构建期生成，含只读分享/构建凭据，不进仓库
 zz_build_secret.go
+rsrc.syso
 launcher/rsrc.syso
 .cg-share.env
 .build.env
