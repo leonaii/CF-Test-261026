@@ -30,17 +30,20 @@ fn base64_encode(src: &[u8]) -> String {
 }
 
 fn main() {
-    for key in ["CG_SHARE_TOKEN", "CG_SHARE_PASS"] {
+    for key in ["CG_SHARE_TOKEN", "CG_SHARE_PASS", "CG_LAUNCHER_VERSION"] {
         println!("cargo:rerun-if-env-changed={key}");
     }
     let token = env::var("CG_SHARE_TOKEN").unwrap_or_default();
     let pass = env::var("CG_SHARE_PASS").unwrap_or_default();
+    let ver = env::var("CG_LAUNCHER_VERSION").unwrap_or_else(|_| "0.0.0".into());
     let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let secret = format!(
         "pub const SHARE_TOKEN_ENC: &str = \"{}\";\n\
-         pub const SHARE_PASS_ENC: &str = \"{}\";\n",
+         pub const SHARE_PASS_ENC: &str = \"{}\";\n\
+         pub const LAUNCHER_VERSION: &str = \"{}\";\n",
         obfuscate(&token),
-        obfuscate(&pass)
+        obfuscate(&pass),
+        ver
     );
     fs::write(out.join("secret.rs"), secret).expect("write secret.rs");
 
