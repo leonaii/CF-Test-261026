@@ -61,21 +61,20 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 		result   setupResult
 	)
 
-	names := profileNames()
-	if len(names) == 0 {
+	// 首屏固定用牛逼上号器：第二屏再用「新上号 / 老上号」区分，
+	// 这里不再让用户选类型，避免两处入口打架。
+	defProf := findProfile(defaultProfileID)
+	if defProf == nil {
 		walk.MsgBox(owner, "错误", "程序内没有可用的上号器类型。", walk.MsgBoxIconError)
 		return nil, setupQuit
 	}
+	names := []string{defProf.Name}
 
 	defIdx := 0
 	defName := ""
 	if cfg != nil {
-		for i := range loaderProfiles {
-			if loaderProfiles[i].ID == cfg.Profile {
-				defIdx = i
-			}
-		}
-		defName = cfg.CloudName
+		// 首屏回显同样走可视卡密（CG 开头 32 位），提交时再还原成真卡密
+		defName = renderCardKey(cfg.CloudName)
 	}
 
 	gray := walk.RGB(140, 140, 140)
@@ -94,7 +93,7 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 			ComboBox{AssignTo: &combo, Model: names, MinSize: Size{Width: 320}},
 
 			VSpacer{Size: 6},
-			Label{Text: "卡密 / 名称", TextColor: dim, Font: Font{PointSize: 9}},
+			Label{Text: "卡密 / 名称（CG 开头 32 位可直接粘贴）", TextColor: dim, Font: Font{PointSize: 9}},
 			LineEdit{AssignTo: &nameEdit, Text: defName},
 
 			VSpacer{},
@@ -118,14 +117,20 @@ func runSetupDialog(owner walk.Form, cfg *appConfig) (*setupResult, setupAction)
 							return
 						}
 
-						name, err := normalizeBackupName(nameEdit.Text())
+						// 可视卡密（CG 开头 32 位）先还原成真卡密，再按原规则校验
+						raw, ok := resolveCardKey(nameEdit.Text())
+						if !ok {
+							walk.MsgBox(dlg, "卡密不合法", "卡密校验失败：请复制完整卡密（CG 开头 32 位），不要手抄改字。", walk.MsgBoxIconWarning)
+							return
+						}
+						name, err := normalizeBackupName(raw)
 						if err != nil {
 							walk.MsgBox(dlg, "卡密不合法", err.Error(), walk.MsgBoxIconWarning)
 							return
 						}
-						p := profileByIndex(combo.CurrentIndex())
+						p := findProfile(defaultProfileID)
 						if p == nil {
-							walk.MsgBox(dlg, "提示", "请选择上号器类型。", walk.MsgBoxIconWarning)
+							walk.MsgBox(dlg, "提示", "程序内没有可用的上号器类型。", walk.MsgBoxIconWarning)
 							return
 						}
 						dir := defaultWorkDir()
@@ -228,8 +233,8 @@ func runMarkDialog(owner walk.Form, row accountRow, current string) (string, boo
 		Size:     Size{Width: 430, Height: 290},
 		Layout:   VBox{},
 		Children: []Widget{
-			Label{Text: "卡密: " + row.Card},
-			Label{Text: "账号: " + row.QQ + "    备注: " + row.Note},
+			Label{Text: "卡密: " + renderCardKey(row.Card)},
+			Label{Text: "账号: " + row.QQ + "    备注: " + renderCardInText(row.Note)},
 			Label{Text: "状态:"},
 			ComboBox{AssignTo: &combo, Model: labels, MinSize: Size{Width: 220}},
 			Composite{
@@ -270,7 +275,7 @@ func runRawNoteDialog(owner walk.Form, row accountRow) {
 	if text == "" || text == "-" {
 		text = "（这个账号没有原始备注）"
 	} else {
-		text = prettyJSON(text)
+		text = renderCardInText(prettyJSON(text))
 	}
 
 	d := Dialog{
@@ -279,7 +284,7 @@ func runRawNoteDialog(owner walk.Form, row accountRow) {
 		Size:     Size{Width: 720, Height: 520},
 		Layout:   VBox{},
 		Children: []Widget{
-			Label{Text: "卡密 " + row.Card + "    QQ " + row.QQ, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+			Label{Text: "卡密 " + renderCardKey(row.Card) + "    QQ " + row.QQ, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
 			TextEdit{AssignTo: &edit, Text: text, ReadOnly: true, VScroll: true, MinSize: Size{Width: 660, Height: 300}},
 			Composite{
 				Layout: HBox{},
