@@ -747,14 +747,28 @@ func selfRemoveFakeRail(gameDir string) {
 	}
 }
 
-// selfEnsureFakeRail 在 ntop_v17_dll\x64 下放一个 1 字节的假 rail_api64.dll。
+// selfEnsureFakeRail 在 <游戏根>\ntop_v17_dll\x64 下放一个 1 字节的假 rail_api64.dll。
 //
-// 复刻样本 sub_140019270 @0x14001A51C：拼 "<dir>\rail_api64.dll" → fopen("wb")
-// → fwrite("x", 1, 1) → fclose。CF 在这个路径拿到无效镜像后 LoadLibrary 失败，
-// 就不再走 WeGame 初始化，从而不会弹 "WeGame Init Failed (2310)"。
-func selfEnsureFakeRail(dir string) {
-	p := dir + `\rail_api64.dll`
+// 新版上号器（IDA sub_140011E50 @0x140011E50）的顺序：
+//
+//	sub_1400ABB10(L"ntop_v17_dll\\x64")  → 建子目录
+//	sub_1400B10F0(..., L"\\rail_api64.dll") → fopen("wb") + fwrite("x",1,1)
+//	sub_1400B10F0(..., L"\\crossfire.exe")  → 再从该目录启动
+//
+// CF 在这个路径拿到无效镜像后 LoadLibrary 失败，就不再走 WeGame 初始化，
+// 因此不会弹 "WeGame Init Failed (2310)"。注意不要写游戏自己的 x64\rail_api64.dll，
+// 那是共享内存/管道要用的真文件。
+func selfEnsureFakeRail(gameDir string) {
+	if strings.TrimSpace(gameDir) == "" {
+		return
+	}
+	p := filepath.Join(gameDir, "ntop_v17_dll", "x64", "rail_api64.dll")
 	if st, err := os.Stat(p); err == nil && st.Size() == 1 {
+		selfLog("假 rail 已存在 %s", p)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		selfLog("建 ntop 目录失败 %s: %v", filepath.Dir(p), err)
 		return
 	}
 	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
@@ -762,6 +776,39 @@ func selfEnsureFakeRail(dir string) {
 		return
 	}
 	selfLog("写假 rail 成功 %s", p)
+}
+
+// selfValidateVersionIni 复刻新版 sub_140011E50 的启动前校验：
+// 读 x64\version.ini，必须同时含 -SSN:<当前区号>、-rotate:0、-cf:1，
+// 且不能带 -HostIP=；不满足时新版直接放弃启动，这里提前报错，避免等到 2310。
+func selfValidateVersionIni(dir, ssn string) error {
+	cands := []string{
+		filepath.Join(dir, "x64", "version.ini"),
+		filepath.Join(dir, "version.ini"),
+	}
+	var body string
+	var used string
+	for _, p := range cands {
+		if raw, err := os.ReadFile(p); err == nil {
+			body, used = string(raw), p
+			break
+		}
+	}
+	if used == "" {
+		return fmt.Errorf("version.ini 缺失（期望 %s）", cands[0])
+	}
+	if ssn != "" && !strings.Contains(body, "-SSN:"+ssn) {
+		return fmt.Errorf("version.ini 的 SSN 与当前大区不一致（%s 里没有 -SSN:%s）", used, ssn)
+	}
+	for _, need := range []string{"-SSN:", "-rotate:0", "-cf:1"} {
+		if !strings.Contains(body, need) {
+			return fmt.Errorf("version.ini 缺少 %s（%s）", need, used)
+		}
+	}
+	if strings.Contains(body, "-HostIP=") {
+		return fmt.Errorf("version.ini 不应包含 -HostIP=（%s）", used)
+	}
+	return nil
 }
 
 // exeDir 返回当前可执行文件所在目录。

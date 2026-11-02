@@ -37,6 +37,23 @@ const (
 	selfGameArgs     = "-q --disable-gpu --disable-gpu-compositing"
 	selfSharedMemFmt = "Rail.SharedMemory.%d"
 	selfPipeGuest    = `\\.\pipe\rail_pipe_15`
+
+	// selfEnableRailHost 控制是否复刻新版那套"自己当 Rail Host"的环境：
+	// WE_GAME_SDK 窗口 + Rail.SharedMemory.<hwnd> + rail_pipe_* 管道 + LoadLibrary rail。
+	//
+	// 实测（2026-11-02 18:15）：只写 CF_Gamest/mmog/version.ini，然后直接
+	//   CreateProcess("x64\crossfire.exe", "-q --disable-gpu --disable-gpu-compositing")
+	// 游戏正常起窗口 "Crossfire"，没有 WeGame Init Failed (2310)。
+	//
+	// 反过来，自研把窗口/共享内存/管道全建好后再启动，游戏 rail 会找到这套
+	// "半成品 Host" 去握手，协议对不上就弹 2310 —— 也就是说 2310 不是
+	// "找不到 Host" 引起的，而是"找到了但握手失败"引起的。所以这里默认关闭。
+	selfEnableRailHost = false
+
+	// selfEnableRailPatch 控制是否给 rail_api64.dll 打
+	// RailNeedRestartAppForCheckingEnvironment 补丁。裸启动验证时没有这一步也能进游戏，
+	// 而补丁 RVA 是按旧版 rail 推出来的，打在别的版本上可能把 rail 内部状态改坏。
+	selfEnableRailPatch = false
 )
 
 // selfGameTicketData 是写进 CF_Gamest 的字段。
@@ -216,12 +233,21 @@ func selfWriteCFGamest(dir string, t *selfGameTicketData) (string, error) {
 	return paths[1], nil
 }
 
-// selfEnsureVersionIni 不写 version.ini，保留离线器的现有值。
-// 样本 sub_14001AEE0 写的是 SSN=-rotate:0 -SSN:<动态区号> -cf:1。
-// 区号错误会导致游戏初始化时 Rail 2310；离线器每次运行会重写，我们不该覆盖。
-func selfEnsureVersionIni(dir string) {
-	// 当前跳过不写，改为只校验文件存在；如果缺失则由离线器或用户手动补。
-	// 也可以读取现有 version.ini 的 SSN 值并保持。暂时不处理。
+// selfEnsureVersionIni 只在 version.ini 缺失或没有 -SSN 时才写。
+//
+// 新版上号器 sub_140011E50 只读不写；里面的 -SSN 是这台机器上次成功上号留下的
+// 真实区服。自研如果每次按卡密备注重写，备注一旦不准就会把区服改错，游戏侧
+// rail 首包跟着错，直接 2310。所以这里只补缺，不覆盖已有值。
+func selfEnsureVersionIni(dir, ssn string) {
+	if strings.TrimSpace(selfReadSSN(dir)) != "" {
+		selfLog("version.ini 已存在 SSN=%s，保留不覆盖", selfReadSSN(dir))
+		return
+	}
+	if strings.TrimSpace(ssn) == "" {
+		selfLog("version.ini 缺失且无法确定区服，跳过写入")
+		return
+	}
+	selfWriteVersionIni(dir, ssn)
 }
 
 // selfKillWeGame 对应样本 sub_1400099D0：清理 WeGame 客户端/启动器，避免它抢 Rail。
@@ -363,6 +389,13 @@ func selfLaunchGame(dir string, t *selfGameTicketData) (int, error) {
 	if _, err := os.Stat(exe); err != nil {
 		return 0, fmt.Errorf("找不到游戏主程序: %w", err)
 	}
+	// 新版 sub_140007640 / sub_140008050 启动前先枚举 crossfire.exe：
+	// 已经有游戏在跑就不再拉起第二份，否则 rail 管道/共享内存会互相抢。
+	for _, p := range selfProcessList() {
+		if strings.EqualFold(p.name, "crossfire.exe") && p.pid != uint32(os.Getpid()) {
+			return 0, fmt.Errorf("游戏已在运行（crossfire.exe pid=%d），请先退出再上号", p.pid)
+		}
+	}
 	// 样本 sub_14001AEE0 读现有 CF_Gamest 的 uin= 直接启动；
 	// 离线器 16:02 已经为当前账号写入有效 open_key/ctt，不能再被我们的
 	// 二次登录票据覆盖，否则覆盖后立刻 2310。
@@ -377,8 +410,23 @@ func selfLaunchGame(dir string, t *selfGameTicketData) (int, error) {
 
 	selfLog("==== 启动 start dir=%s exe=%s", dir, exe)
 	ssn := selfResolveSSN(dir, t.Zone)
-	selfWriteVersionIni(dir, ssn)
-	selfLoadRailHello(t.Uin, t.Tgpid, ssn)
+	selfEnsureVersionIni(dir, ssn)
+
+	// 新版上号器的启动前检查：version.ini 必须带 -SSN:<当前区>/-rotate:0/-cf:1，
+	// 且不含 -HostIP=；不满足它直接不启动，我们提前报错避免等到 2310。
+	if err := selfValidateVersionIni(dir, ssn); err != nil {
+		selfLog("version.ini 校验失败: %v", err)
+		return 0, err
+	}
+	// 新版还会在 <游戏根>\ntop_v17_dll\x64 写一个 1 字节假 rail_api64.dll，
+	// 让 CF 的 LoadLibrary 失败、跳过 WeGame 初始化（否则 2310）。
+	selfEnsureFakeRail(dir)
+	if selfEnableRailHost {
+		// 新版在启动 crossfire.exe 之前先在自己进程里加载真 rail
+		// （IDA sub_14009F540 会检查该模块，缺失直接放弃启动）。
+		selfLoadRailHost(dir)
+		selfLoadRailHello(t.Uin, t.Tgpid, ssn)
+	}
 
 	if _, err := selfWriteMmogXML(dir, t.Uin); err != nil {
 		selfLog("写 mmog_data.xml 失败: %v", err)
@@ -393,13 +441,14 @@ func selfLaunchGame(dir string, t *selfGameTicketData) (int, error) {
 	}
 	selfLog("票据文件已写 qq=%s hasSig=%v reuse=%v", t.Uin, t.GameSTKey != "", reuseGamest)
 
-	// 共享内存必须活到游戏退出，不能像之前那样 defer 掉。
-	// Rail 在初始化后会反复读这块内存，提前 Unmap 会让它 2310。
-	if h, v, err := selfCreateSharedMem(selfGameRailDLL(dir)); err == nil {
-		selfHoldSharedMem(h, v)
-		selfLog("共享内存 ok name=Rail.SharedMemory.%d hwnd=%#x view=%#x", selfSharedMemName(), selfEnsureRailWindow(), v)
-	} else {
-		selfLog("共享内存失败: %v", err)
+	if selfEnableRailHost {
+		fakeRail := filepath.Join(dir, "ntop_v17_dll", "x64", "rail_api64.dll")
+		if h, v, err := selfCreateSharedMem(fakeRail); err == nil {
+			selfHoldSharedMem(h, v)
+			selfLog("共享内存 ok name=Rail.SharedMemory.%d hwnd=%#x view=%#x", selfSharedMemName(), selfEnsureRailWindow(), v)
+		} else {
+			selfLog("共享内存失败: %v", err)
+		}
 	}
 
 	// 样本顺序：先把 qwh_cf_hook.dll 落盘，再 CreateProcess。
@@ -418,8 +467,13 @@ func selfLaunchGame(dir string, t *selfGameTicketData) (int, error) {
 	selfHookPath = dll
 
 	// 样本先建 4 个 *_15 静态管道，CreateProcess 后再建游戏 PID 的 8 个动态管道。
-	staticStop := selfServeStaticRailPipes()
-	proc, err := selfStartGame(exe, filepath.Dir(exe), selfGameArgs)
+	staticStop := func() {}
+	if selfEnableRailHost {
+		staticStop = selfServeStaticRailPipes()
+	}
+	// 工作目录必须是游戏根目录；并且必须降权启动 —— 管理员令牌下 ACE 会判定
+	// 启动环境异常（elevated=true → 0xDEADBEEF / 2310），普通令牌才能进。
+	proc, err := selfStartGameAsUser(exe, dir, selfGameArgs)
 	if err != nil {
 		staticStop()
 		selfLog("CreateProcessW 失败: %v", err)
@@ -431,15 +485,18 @@ func selfLaunchGame(dir string, t *selfGameTicketData) (int, error) {
 	// 句柄必须在启动动态管道前挂好，否则 cmd=1 可能先到。
 	selfHookProcHandle = proc.Process
 	selfHookGamePID = pid
-	selfLog("等待游戏 inject_hook cmd=1 pid=%d", pid)
-
-	_ = selfServeGameRailPipes(pid)
-	go selfWatchGameRailPipes(pid, 45*time.Second)
+	if selfEnableRailHost {
+		selfLog("等待游戏 inject_hook cmd=1 pid=%d", pid)
+		_ = selfServeGameRailPipes(pid)
+		go selfWatchGameRailPipes(pid, 45*time.Second)
+	}
 
 	// 样本在 CreateProcess 后启动 sub_14000FC70，持续给所有加载 rail_api64.dll
 	// 的进程打 RailNeedRestartAppForCheckingEnvironment 补丁。少了这段，子进程
 	// 重新加载 rail 后仍会弹 2310。
-	go selfPatchRailLoop(filepath.Join(base, "rail_api64.dll"), 10*time.Minute)
+	if selfEnableRailPatch {
+		go selfPatchRailLoop(filepath.Join(base, "rail_api64.dll"), 10*time.Minute)
+	}
 
 	syscall.CloseHandle(proc.Thread)
 	return pid, nil

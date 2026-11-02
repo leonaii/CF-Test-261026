@@ -51,15 +51,22 @@ func selfNormalizeZone(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// selfResolveSSN 返回当前卡的大区 SSN；未知时保留 version.ini 现有值。
+// selfResolveSSN 返回本次要用的区服 SSN。
+//
+// 新版上号器（IDA sub_140011E50）只读取游戏目录的 version.ini 做校验，从不改写它：
+// 里面的 -SSN 是这台机器上一次成功上号留下的真实区服。自研以前优先用卡密备注里的
+// 大区，备注不准（例如写"四川一区"而账号实际在别的区）就会把 version.ini 和 rail
+// 首包一起改错，游戏侧 rail 握手失败 → WeGame Init Failed (2310)。
+//
+// 所以顺序反过来了：现有 version.ini 优先，只有它缺失/没有 -SSN 时才按卡密大区补。
 func selfResolveSSN(dir, zone string) string {
+	if ssn := selfReadSSN(dir); ssn != "" {
+		return ssn
+	}
 	if z := selfNormalizeZone(zone); z != "" {
 		if ssn := selfZoneSSNByName[z]; ssn != "" {
 			return ssn
 		}
-	}
-	if ssn := selfReadSSN(dir); ssn != "" {
-		return ssn
 	}
 	return ""
 }

@@ -119,9 +119,10 @@ func selfLoginResultData(res *selfLoginResult, tk *ymmTicket) (*selfGameTicketDa
 // mcode 校验失败（8010170）时再用抓包模板里的本机 machine_id 试一次。
 func selfLoginByIni(tk *ymmTicket, saveDir string) (*selfGameTicketData, error) {
 	stk := selfTickFromIni(tk)
-	// ini 里带 NT 登录产物（client_key/st_key）就走 qq_info_type=6，与真上号器一致；
-	// 缺这两个字段才退回纯 QQ 的 type=4。NT-only 卡先完成 KEX + EasyLogin + FirstAuth。
-	if strings.TrimSpace(stk.Sig) == "" {
+	// 新版流程：只要卡里有 Token0106，就先走 NT 免密登录（KEX → SsoNTLoginEasyLogin
+	// → QQConnectLogin.auth）刷新 sig，而不是直接吃 ini 里可能已过期的 sig。
+	// 刷新失败才沿用 ini 的 sig，避免 Token0106 失效时整条链路直接断。
+	if tok := strings.TrimSpace(tk.Token0106); tok != "" {
 		uin, err := strconv.ParseUint(strings.TrimSpace(tk.QQ), 10, 64)
 		if err != nil || uin == 0 {
 			return nil, errors.New("NT 登录需要有效的 QQ 号")
@@ -133,24 +134,25 @@ func selfLoginByIni(tk *ymmTicket, saveDir string) (*selfGameTicketData, error) 
 				machineID = nil // 回退到 MD5(uin+"ComputerID")
 			}
 		}
-		token0106, err := hex.DecodeString(strings.TrimSpace(tk.Token0106))
-		if err != nil {
-			return nil, fmt.Errorf("Token0106 不是合法 hex: %w", err)
+		token0106, derr := hex.DecodeString(tok)
+		if derr == nil && len(token0106) > 0 {
+			if nt, e := selfNTLogin(uin, machineID, token0106); e == nil {
+				stk.Sig = nt.Sig
+				stk.Raw["sig"] = nt.Sig
+				tk.Sig = nt.Sig
+				if len(nt.Token0106) > 0 {
+					tk.Token0106 = strings.ToUpper(hex.EncodeToString(nt.Token0106))
+				}
+				selfLog("NT 免密登录成功 QQ=%s sig=%s", tk.QQ, shortHex(nt.Sig, 8))
+			} else {
+				selfLog("NT 免密登录失败，沿用 ini 的 sig（%s）: %v", shortHex(stk.Sig, 8), e)
+			}
+		} else {
+			selfLog("Token0106 不是合法 hex，沿用 ini 的 sig")
 		}
-		if len(token0106) == 0 {
-			return nil, errors.New("这张卡缺少 Token0106，无法进行 NT 登录")
-		}
-		nt, err := selfNTLogin(uin, machineID, token0106)
-		if err != nil {
-			return nil, fmt.Errorf("NT 登录失败: %w", err)
-		}
-		stk.Sig = nt.Sig
-		stk.Raw["sig"] = nt.Sig
-		tk.Sig = nt.Sig
-		if len(nt.Token0106) > 0 {
-			tk.Token0106 = strings.ToUpper(hex.EncodeToString(nt.Token0106))
-		}
-		selfLog("NT 登录成功 QQ=%s sig=%s", tk.QQ, shortHex(nt.Sig, 8))
+	}
+	if strings.TrimSpace(stk.Sig) == "" {
+		return nil, errors.New("这张卡既没有可用 sig，也无法完成 NT 免密登录")
 	}
 
 	hasNT := strings.TrimSpace(stk.Raw["client_key"]) != "" && strings.TrimSpace(stk.Raw["st_key"]) != ""
