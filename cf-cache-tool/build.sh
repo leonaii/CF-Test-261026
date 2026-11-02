@@ -353,8 +353,55 @@ EOF
     echo "==> [loader] 已发布 ${exe_name}"
 }
 
+# 牛逼上号器（ID 2）：只有 exe，不读 host.dat。
+# 资源目录：../资源/上号器/niubi（可用 NIUBI_ASSET_DIR 覆盖）
+# 云端文件名 CF上号器.exe（URL 需要 percent-encoding，DAV 才能正确落盘中文名）
+sync_loader_jige() {
+    local dir="${NIUBI_ASSET_DIR:-../资源/上号器/niubi}"
+    local src="$dir/CF上号器.exe"
+    if [ ! -f "$src" ]; then
+        echo "==> [loader2] 跳过：$src 不存在"
+        return 0
+    fi
+    local exe_name="CF上号器.exe"
+    local exe_url="CF%E4%B8%8A%E5%8F%B7%E5%99%A8.exe"
+    local exe_sha exe_size remote
+    exe_sha="$(sha256 "$src")"
+    exe_size="$(wc -c < "$src" | tr -d ' ')"
+    remote="$(curl -s -u "$AUTH" "$BASE/CG/loaders/2/meta.json" || true)"
+    if echo "$remote" | grep -q "$exe_sha" && echo "$remote" | grep -q "$exe_name"; then
+        echo "==> [loader2] 云端已是最新（${exe_name}），跳过上传"
+        return 0
+    fi
+    echo "==> [loader2] 上传 ${exe_name} ($((exe_size/1024/1024)) MB)"
+    curl -sS -u "$AUTH" -X MKCOL "$BASE/CG/" >/dev/null || true
+    curl -sS -u "$AUTH" -X MKCOL "$BASE/CG/loaders/" >/dev/null || true
+    curl -sS -u "$AUTH" -X MKCOL "$BASE/CG/loaders/2/" >/dev/null || true
+    curl -sS -u "$AUTH" -T "$src" "$BASE/CG/loaders/2/${exe_url}" >/dev/null
+    # 清掉上一版遗留的英文名
+    curl -sS -u "$AUTH" -X DELETE "$BASE/CG/loaders/2/jige.exe" >/dev/null || true
+
+    local meta
+    meta="$(mktemp)"
+    cat > "$meta" <<EOF
+{
+  "id": "2",
+  "name": "牛逼上号器",
+  "exe": "${exe_name}",
+  "exe_sha256": "$exe_sha",
+  "exe_size": $exe_size,
+  "dat_sha256": "",
+  "updated": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    curl -sS -u "$AUTH" -T "$meta" "$BASE/CG/loaders/2/meta.json" >/dev/null
+    rm -f "$meta"
+    echo "==> [loader2] 已发布 ${exe_name}"
+}
+
 if [ "$SYNC_LOADER" = "1" ]; then
     sync_loader
+    sync_loader_jige
 fi
 
 if [ "$PUBLISH" = "1" ]; then
