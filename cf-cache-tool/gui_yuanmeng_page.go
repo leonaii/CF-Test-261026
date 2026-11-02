@@ -32,9 +32,10 @@ func (a *guiApp) ymmPage() Widget {
 
 	ops := []Widget{
 		PushButton{AssignTo: &a.ymm.btnVerify, Text: "①查封", MinSize: Size{Width: 80, Height: btnH}, OnClicked: a.ymmQuerySelected},
-		PushButton{Text: "新上号", MinSize: Size{Width: 88, Height: btnH}, OnClicked: a.ymmLaunchNewClick},
-		PushButton{Text: "老上号", MinSize: Size{Width: 88, Height: btnH}, OnClicked: a.ymmLaunchOldClick},
-		PushButton{AssignTo: &a.ymm.btnSelfOp, Text: "③自研上号", MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.ymmSelfOpClick},
+		PushButton{Text: "②新上号", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchNewClick},
+		PushButton{Text: "②老上号", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchOldClick},
+		// 自研上号暂时下线（2310 未解决），保留入口但置灰。
+		PushButton{AssignTo: &a.ymm.btnSelfOp, Text: "③自研上号", Enabled: false, MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.ymmSelfOpClick},
 		PushButton{Text: "复制卡密", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmCopyCard},
 		PushButton{AssignTo: &a.ymm.btnSource, Text: "数据源：在线", MinSize: Size{Width: 110, Height: btnH}, OnClicked: func() { a.ymm.toggleSource() }},
 		CheckBox{
@@ -477,7 +478,7 @@ func (a *guiApp) ymmLaunchYuanmeng(row ymmRow) {
 		a.ymm.logf("准备失败: %v", err)
 		return
 	}
-	a.ymm.logf("老上号（圆梦）：QQ %s（卡密 %s）", row.QQ, row.CardKey)
+	a.ymm.logf("老上号：QQ %s", row.QQ)
 
 	go func() {
 		a.ui(a.spinBegin)
@@ -489,17 +490,11 @@ func (a *guiApp) ymmLaunchYuanmeng(row ymmRow) {
 			return
 		}
 
-		// 与回放流程一致：config.ini 里写占位卡密，游戏目录由上号器界面选
-		// 离线上号额外把 auto_zone 设成 1（自动选区）
+		// config.ini 里写占位卡密，游戏目录由上号器界面选（auto_zone=1 自动选区）
 		dir := filepath.Dir(launcher)
-		if _, changed, e := writeOfflineConfig(dir); e != nil {
+		if _, _, e := writeOfflineConfig(dir); e != nil {
 			a.ui(func() { a.ymm.logf("写 config.ini 失败: %v", e) })
-		} else if changed {
-			a.ui(func() { a.ymm.logf("已写入 config.ini（card=%s, auto_zone=1，首次需在上号器里选游戏目录）", placeholderCard) })
-		} else {
-			a.ui(func() { a.ymm.logf("config.ini 就绪（card=%s, auto_zone=1）", placeholderCard) })
 		}
-		a.ui(func() { a.ymm.logf("本地服务器 %s（host.dat 临时切到本地，退出后自动还原）", ymmLocalPrefix) })
 
 		// 取 ini 要联网，先把公用代理备好，避免直连 IP 被限频
 		if ymmProxy.Enabled() {
@@ -521,13 +516,17 @@ func (a *guiApp) ymmLaunchYuanmeng(row ymmRow) {
 			a.ui(func() { a.ymm.logf("失败: %v", err) })
 			return
 		}
-		a.ui(func() { a.ymm.logf("上号器已退出，host.dat 已还原") })
 	}()
 }
 
 // ymmSelfOpClick ③自研上号：只用这一行的票据自己换 openid 再启动游戏，
 // 不经过真上号器。按钮只挂在第二界面，第一界面的「自研上号」不受影响。
 func (a *guiApp) ymmSelfOpClick() {
+	// 自研上号暂停：按钮已置灰，这里再挡一层，避免快捷键/程序化调用绕过。
+	if true {
+		a.ymm.setErr("③自研上号：暂时下线")
+		return
+	}
 	row, ok := a.ymm.selected()
 	if !ok {
 		a.ymm.setErr("③自研上号：请先在列表里选中一行")

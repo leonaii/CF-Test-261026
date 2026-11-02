@@ -243,7 +243,6 @@ func jigeLaunchOffline(launcher, ini, qq, zone string, logf func(string, ...any)
 		return fmt.Errorf("起本地卡密服务失败: %v", err)
 	}
 	defer stop()
-	logf("本地卡密服务 %s（QQ %s / %s）", addr, qq, zone)
 
 	backup, existed := winhttpBackup()
 	jigeMarkProxyActive(backup, existed)
@@ -255,17 +254,14 @@ func jigeLaunchOffline(launcher, ini, qq, zone string, logf func(string, ...any)
 	if err := winhttpSetProxy(addr); err != nil {
 		return err
 	}
-	logf("WinHTTP 代理已指向 %s", addr)
 
 	cmd := exec.Command(launcher)
 	cmd.Dir = filepath.Dir(launcher)
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动上号器失败: %v", err)
 	}
-	logf("已启动上号器: %s", launcher)
 	go jigeAutoDrive(uint32(cmd.Process.Pid), jigeRandomCard(), logf)
 	err = cmd.Wait()
-	logf("上号器已退出，正在还原 WinHTTP 代理")
 	if e := winhttpResetProxy(); e != nil {
 		// 已经按备份还原过注册表，这里 reset 只是让 netsh 的缓存同步，失败不影响
 		_ = e
@@ -292,7 +288,7 @@ func (a *guiApp) ymmLaunchJige(row ymmRow) {
 	if zone == "" {
 		zone = "河南一区"
 	}
-	a.ymm.logf("新上号（牛逼）：QQ %s（卡密 %s / %s）", row.QQ, row.CardKey, zone)
+	a.ymm.logf("新上号：QQ %s", row.QQ)
 
 	go func() {
 		a.ui(a.spinBegin)
@@ -329,7 +325,7 @@ func (a *guiApp) ymmLaunchJige(row ymmRow) {
 			a.ui(func() { a.ymm.logf("失败: %v", err) })
 			return
 		}
-		a.ui(func() { a.ymm.logf("牛逼上号器已退出，WinHTTP 代理已还原") })
+		_ = err
 	}()
 }
 
