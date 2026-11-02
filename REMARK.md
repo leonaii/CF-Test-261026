@@ -497,3 +497,47 @@ CG-cli.exe cloud -name leonai     看云端账号与标记
 CG-cli.exe cloud -list            看所有卡密
 CG-cli.exe clean                  清理更新残留
 ```
+
+---
+
+## 11. 可视卡密（界面显示）
+
+界面上不再直接显示 16 位真卡密，统一显示成：
+
+```text
+CG + 补齐的 0 + 加密串 = 32 位     例：CG0000003E04Z8ENMC9NS46R02X5GY33
+```
+
+- 实现全在 `cardvis.go`：`renderCardKey`（渲染）、`decodeCardKey`（还原）、
+  `renderCardInText`（把备注里夹着的卡密一起换掉）
+- 真卡密 16 位 A-Z → 5 bit/字符打包 → 加魔数、分隔字节、CRC16 → AES-256-CTR
+  → 自定义 base32 编成 24 位；前面补 6 个 0 凑满 32 位
+- 渲染是**确定性**的：同一张卡每次结果相同，换机器也一致；改 `cardVisSecret`
+  会让历史渲染串全部失效
+- 生效位置：首屏卡密输入框（回显 + 粘贴）、上号中/加载窗口、复制卡密、
+  列表的卡密列与备注列、查封/标记/验证/原始备注弹窗
+- 首屏可以直接粘贴 32 位渲染串：`resolveCardKey` 解回真卡密后再查平台、上号；
+  解不开的按“卡密不合法”拦下，不会当成普通名称放过去
+- **真卡密仍然只用于**：卡密平台接口、`config.ini` 占位卡密、离线上号的 pin、
+  云端目录 `CG/<卡密>/<ID>/`。显示层改动不影响上号器流程
+- 日志（`run.log`）保持真卡密，方便排障；精简模式不落日志
+
+### 11.1 本地落盘（`cardstore.go`）
+
+磁盘上同样不出现明文真卡密，统一存可视形态；内存里始终是真卡密。
+
+| 位置 | 说明 |
+|---|---|
+| `%AppData%\CG\config.json` | `cloud_name`、`marks` 的键写可视串；`loadAppConfig` 读入即还原 |
+| `data\cache\<可视卡密>\` | 目录名、`*.meta.json` 的 `card` 与 `request`（里面有 `card_key`） |
+| `data\cache.recording\<可视卡密>\` | 录制暂存，合并时按可视目录名落正式缓存 |
+| `data\history.jsonl` | `card` 与 `note`（备注里夹着卡密） |
+| `data\verify_snapshot.json` | `card` 与 `message` |
+| `data\dump\cards.jsonl` | `card_key`、`note`/`zone` 逐行渲染；下载时直接转，读的时候 `loadCardKey` 还原 |
+
+- 读写封装：`storeCardKey` / `loadCardKey`；路径封装：`cardDirName` / `cacheCardDir`
+- `migrateLocalCardStore` 在启动时（以及换工作目录后）把老数据一次性改名/改写：
+  目录重命名、meta 的 `card`/`request` 改写、history/快照/离线列表重写；
+  按目录去重，只跑一次。老版本目录仍能读（`cacheCardDir` 有回退），不会丢数据
+- **云端目录没动**：仍是 `CG/<真卡密>/<ID>/`，换机器/老客户端都还能对上；本地磁盘不再留明文
+- 自研上号的 `data\selfop\` 诊断包仍含完整票据与卡密，属于排障产物，不在本机制内
