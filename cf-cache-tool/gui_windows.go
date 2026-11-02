@@ -108,13 +108,13 @@ func (m *accountModel) Value(row, col int) interface{} {
 		}
 		return "正常"
 	case 1:
-		return r.Card
+		return renderCardKey(r.Card)
 	case 2:
 		return r.QQ
 	case 3:
 		return r.OpenID
 	case 4:
-		return r.Note
+		return renderCardInText(r.Note)
 	case 5:
 		return r.Zone
 	case 6:
@@ -205,6 +205,8 @@ func runGUI() (err error) {
 
 	cfg := loadAppConfig()
 	_, _ = migrateWorkDir(cfg)
+	// 本地落盘统一换成可视卡密：老版本留下的是明文目录/字段，这里一次性迁移
+	migrateStartupWorkDir(cfg)
 
 	// CF 卡密每次都要停在第一屏确认，不进第二屏
 	needSetup := cfg == nil || cfg.WorkDir == "" || cfg.CloudName == "" || findProfile(cfg.Profile) == nil
@@ -290,6 +292,7 @@ func (a *guiApp) init() error {
 		a.dir = exeDir
 	}
 	a.cacheDir = filepath.Join(a.dir, "cache")
+	migrateLocalCardStore(a.dir) // 首配可能换了工作目录，这里补一次迁移
 	a.listen = "127.0.0.1:18800"
 	// 代理 IP 落盘缓存：下次启动 180s 内直接复用，省一次取 IP 往返
 	ymmProxy.setCachePath(filepath.Join(a.dir, "proxy.json"))
@@ -340,8 +343,20 @@ func (a *guiApp) init() error {
 		if cur, err := DecryptHostDat(a.host.Path); err == nil && cur == "http://"+a.listen {
 			_ = a.host.Restore()
 		}
+		// 离线上号期间接管过 WinHTTP 代理，退出时兜底还原（后台 goroutine 可能被直接杀掉）
+		if jigeRestoreProxyIfActive() {
+			a.logf("已还原 WinHTTP 代理")
+		}
 		a.runLog.line("程序退出")
 		a.runLog.close()
+
+		// 退出兜底：窗口已关但消息循环偶发不退出时，不让进程留在后台。
+		// 这里只做纯退出，不再碰任何控件/文件。
+		go func() {
+			defer func() { _ = recover() }()
+			time.Sleep(5 * time.Second)
+			os.Exit(0)
+		}()
 	})
 	a.reloadAccounts()
 	a.refreshHostState()
@@ -754,6 +769,7 @@ func (a *guiApp) applyConfig() {
 	a.profile = findProfile(a.cfg.Profile)
 	a.dir = a.cfg.WorkDir
 	a.cacheDir = filepath.Join(a.dir, "cache")
+	migrateLocalCardStore(a.dir) // 换工作目录后同样把明文卡密迁移成可视形态
 	a.host = NewHostDatManager(filepath.Join(a.dir, "host.dat"))
 	a.loaderReady.Store(false)
 	if a.ymm.api == nil {
@@ -1000,7 +1016,7 @@ func (a *guiApp) profileID() string {
 	if a.profile != nil && a.profile.ID != "" {
 		return a.profile.ID
 	}
-	return "1"
+	return defaultProfileID
 }
 
 // markSelected 给选中账号打标记（封禁 / 黑屋 / 过期 / 其他 / 正常）。
@@ -1415,7 +1431,7 @@ func runVerifyDialog(owner walk.Form, row accountRow) {
 		Size:     Size{Width: 720, Height: 520},
 		Layout:   VBox{},
 		Children: []Widget{
-			Label{Text: "卡密 " + row.Card + "    QQ " + row.QQ, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+			Label{Text: "卡密 " + renderCardKey(row.Card) + "    QQ " + row.QQ, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
 			TextEdit{AssignTo: &edit, Text: verifyDetailText(row), ReadOnly: true, VScroll: true, MinSize: Size{Width: 660, Height: 300}},
 			Composite{
 				Layout: HBox{},

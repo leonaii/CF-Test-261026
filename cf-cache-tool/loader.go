@@ -17,9 +17,22 @@ type loaderProfile struct {
 	SiteName string // 卡网名称
 	Site     string // 卡网链接
 	SiteNote string // 购买说明
+
+	// LocalOnly 表示本机已有 exe 时优先直用，不走云端校验（开发者本机）。
+	LocalOnly bool
+	// NoHostDat 表示这套上号器不读 host.dat（CG 用 WinHTTP 代理喂票据）。
+	NoHostDat bool
 }
 
 var loaderProfiles = []loaderProfile{
+	{
+		ID:        "2",
+		Name:      "牛逼上号器",
+		ExeName:   "CF上号器.exe",
+		SiteName:  "牛逼直登",
+		SiteNote:  "离线票据桥接，不需要在线卡密",
+		NoHostDat: true,
+	},
 	{
 		ID:       "1",
 		Name:     "圆梦上号器",

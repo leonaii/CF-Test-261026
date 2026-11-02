@@ -3,8 +3,8 @@ package main
 // yuanmeng 页的控件与按钮回调：数据来自卡密平台接口，不再读本地 dump。
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -31,8 +31,9 @@ func (a *guiApp) ymmPage() Widget {
 	a.ymm.sortAsc = false
 
 	ops := []Widget{
-		PushButton{AssignTo: &a.ymm.btnVerify, Text: "①查封", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmQuerySelected},
-		PushButton{Text: "②上号", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmLaunchViaLauncherClick},
+		PushButton{AssignTo: &a.ymm.btnVerify, Text: "①查封", MinSize: Size{Width: 80, Height: btnH}, OnClicked: a.ymmQuerySelected},
+		PushButton{Text: "新上号", MinSize: Size{Width: 88, Height: btnH}, OnClicked: a.ymmLaunchNewClick},
+		PushButton{Text: "老上号", MinSize: Size{Width: 88, Height: btnH}, OnClicked: a.ymmLaunchOldClick},
 		PushButton{AssignTo: &a.ymm.btnSelfOp, Text: "③自研上号", MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.ymmSelfOpClick},
 		PushButton{Text: "复制卡密", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmCopyCard},
 		PushButton{AssignTo: &a.ymm.btnSource, Text: "数据源：在线", MinSize: Size{Width: 110, Height: btnH}, OnClicked: func() { a.ymm.toggleSource() }},
@@ -339,7 +340,7 @@ func (a *guiApp) ymmVerifyDialog(v verifyDialog) {
 			b.WriteString("查询过于频繁，请稍后再试\r\n\r\n")
 		}
 	}
-	fmt.Fprintf(&b, "卡密：%s\r\n", dash(card))
+	fmt.Fprintf(&b, "卡密：%s\r\n", dash(renderCardKey(card)))
 	fmt.Fprintf(&b, "QQ：%s\r\n", dash(st.QQ))
 	fmt.Fprintf(&b, "区服：%s\r\n", dash(st.Zone))
 	fmt.Fprintf(&b, "状态：%s\r\n", dash(st.Status))
@@ -419,49 +420,55 @@ func (a *guiApp) ymmCopyCard() {
 		a.ymm.logf("该账号没有卡密")
 		return
 	}
-	if err := copyToClipboard(row.CardKey); err != nil {
+	// 复制出去的是可视卡密：贴回首屏登录框能还原成真卡密再去上号
+	shown := renderCardKey(row.CardKey)
+	if err := copyToClipboard(shown); err != nil {
 		a.ymm.logf("复制失败: %v", err)
 		return
 	}
-	a.ymm.logf("已复制卡密 %s", row.CardKey)
+	a.ymm.logf("已复制卡密 %s", shown)
 }
 
-// ymmLaunchViaLauncherClick 离线上号：CG 冒充卡密服务器，让上号器自己上号。
-func (a *guiApp) ymmLaunchViaLauncherClick() {
+// ymmLaunchNewClick 新上号：牛逼上号器（本地假卡密服务 + WinHTTP 代理）。
+func (a *guiApp) ymmLaunchNewClick() {
 	row, ok := a.ymm.selected()
 	if !ok {
 		a.ymm.logf("请先选中一行")
 		return
 	}
-	a.ymmLaunchOffline(row)
+	a.ymmLaunchJige(row)
 }
 
-// ymmLaunchOffline 用指定行启动离线上号（ini 由本地服务器按需从接口拉）。
-func (a *guiApp) ymmLaunchOffline(row ymmRow) {
+// ymmLaunchOldClick 老上号：圆梦上号器（host.dat 回放）。
+func (a *guiApp) ymmLaunchOldClick() {
+	row, ok := a.ymm.selected()
+	if !ok {
+		a.ymm.logf("请先选中一行")
+		return
+	}
+	a.ymmLaunchYuanmeng(row)
+}
+
+// ensureLoaderFor 按需准备指定上号器：本地已有直接用，否则从云端下载。
+func (a *guiApp) ensureLoaderFor(p *loaderProfile) (string, error) {
+	if p == nil {
+		return "", fmt.Errorf("上号器类型无效")
+	}
+	if ok, _ := localLoaderReady(a.dir, p); ok {
+		return filepath.Join(a.dir, p.ExeName), nil
+	}
+	a.ui(func() { a.ymm.logf("正在按需下载 %s…", p.Name) })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	return syncLoader(ctx, a.dir, p, func(f string, args ...any) {
+		a.ui(func() { a.ymm.logf(f, args...) })
+	})
+}
+
+// ymmLaunchYuanmeng 老上号：CG 冒充卡密服务器 + 改 host.dat，让圆梦上号器自己上号。
+func (a *guiApp) ymmLaunchYuanmeng(row ymmRow) {
 	if row.QQ == "" || row.CardKey == "" {
 		a.ymm.logf("该行缺少 QQ 或卡密")
-		return
-	}
-
-	launcher := a.loader
-	if launcher == "" {
-		cands := []string{
-			filepath.Join(exeDir(), "..", "资源", "上号器", "yuanmeng", "CF上号器_v1.17.exe"),
-			filepath.Join(exeDir(), "CF上号器_v1.17.exe"),
-		}
-		for _, c := range cands {
-			if _, err := os.Stat(c); err == nil {
-				launcher = filepath.Clean(c)
-				break
-			}
-		}
-	}
-	if launcher == "" {
-		a.ymm.logf("找不到上号器 exe，请把 CF上号器_v1.17.exe 放到 CG 同级或 资源\\上号器\\yuanmeng\\")
-		return
-	}
-	if _, err := os.Stat(launcher); err != nil {
-		a.ymm.logf("上号器不存在: %s", launcher)
 		return
 	}
 
@@ -470,24 +477,29 @@ func (a *guiApp) ymmLaunchOffline(row ymmRow) {
 		a.ymm.logf("准备失败: %v", err)
 		return
 	}
-
-	// 与回放流程一致：config.ini 里写占位卡密，游戏目录由上号器界面选
-	// 离线上号额外把 auto_zone 设成 1（自动选区）
-	dir := filepath.Dir(launcher)
-	if _, changed, e := writeOfflineConfig(dir); e != nil {
-		a.ymm.logf("写 config.ini 失败: %v", e)
-	} else if changed {
-		a.ymm.logf("已写入 config.ini（card=%s, auto_zone=1，首次需在上号器里选游戏目录）", placeholderCard)
-	} else {
-		a.ymm.logf("config.ini 就绪（card=%s, auto_zone=1，保留已选游戏目录）", placeholderCard)
-	}
-
-	a.ymm.logf("离线上号：%s（卡密 %s）", launcher, row.CardKey)
-	a.ymm.logf("本地服务器 %s（host.dat 会临时切到本地，上号器退出后自动还原）", ymmLocalPrefix)
+	a.ymm.logf("老上号（圆梦）：QQ %s（卡密 %s）", row.QQ, row.CardKey)
 
 	go func() {
 		a.ui(a.spinBegin)
 		defer a.ui(a.spinEnd)
+
+		launcher, err := a.ensureLoaderFor(findProfile("1"))
+		if err != nil {
+			a.ui(func() { a.ymm.logf("获取上号器失败: %v", err) })
+			return
+		}
+
+		// 与回放流程一致：config.ini 里写占位卡密，游戏目录由上号器界面选
+		// 离线上号额外把 auto_zone 设成 1（自动选区）
+		dir := filepath.Dir(launcher)
+		if _, changed, e := writeOfflineConfig(dir); e != nil {
+			a.ui(func() { a.ymm.logf("写 config.ini 失败: %v", e) })
+		} else if changed {
+			a.ui(func() { a.ymm.logf("已写入 config.ini（card=%s, auto_zone=1，首次需在上号器里选游戏目录）", placeholderCard) })
+		} else {
+			a.ui(func() { a.ymm.logf("config.ini 就绪（card=%s, auto_zone=1）", placeholderCard) })
+		}
+		a.ui(func() { a.ymm.logf("本地服务器 %s（host.dat 临时切到本地，退出后自动还原）", ymmLocalPrefix) })
 
 		// 取 ini 要联网，先把公用代理备好，避免直连 IP 被限频
 		if ymmProxy.Enabled() {
@@ -581,7 +593,7 @@ func (a *guiApp) ymmSelfOpRun(row ymmRow, dir string) {
 		}
 	}()
 	a.ui(a.spinBegin)
-	step("开始 %s（QQ %s）", row.CardKey, row.QQ)
+	step("开始 %s（QQ %s）", renderCardKey(row.CardKey), row.QQ)
 	step("游戏目录：%s", dir)
 
 	// 用客户自己游戏目录里的 rail_api64.dll（不内置、不从 WeGame 取）
@@ -620,6 +632,8 @@ func (a *guiApp) ymmSelfOpRun(row ymmRow, dir string) {
 		fail("换 OP 失败：%v", err)
 		return
 	}
+	// 卡密大区必须带进启动流程，否则 version.ini 会沿用上一个账号的 SSN。
+	data.Zone = row.Area
 	step("OP 票据就绪 openid=%s open_key=%s… ctt=%s…",
 		data.OpenID, shortHex(data.OpenKey, 8), shortHex(data.CTT, 10))
 	if data.CTT == "" {

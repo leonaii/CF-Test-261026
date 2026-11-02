@@ -73,10 +73,83 @@ func fileSHA256(p string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+func copyFileLocal(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		return err
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// ensureLocalLoader 本地直供上号器：目标目录没有就从 CG 同级 / other-tools 拷一份。
+func ensureLocalLoader(dir string, p *loaderProfile) (string, error) {
+	if p == nil {
+		return "", errors.New("未指定上号器类型")
+	}
+	dst := filepath.Join(dir, p.ExeName)
+	if st, err := os.Stat(dst); err == nil && st.Size() > 0 {
+		return dst, nil
+	}
+	base, _ := os.Executable()
+	exeDir := filepath.Dir(base)
+	names := []string{p.ExeName}
+	if p.NoHostDat {
+		names = append(names, "鸡哥直登.exe")
+	}
+	for _, name := range names {
+		cands := []string{
+			filepath.Join(exeDir, name),
+			filepath.Join(exeDir, "other-tools", "kunge", name),
+			filepath.Join(exeDir, "..", "other-tools", "kunge", name),
+			filepath.Join(exeDir, "..", "..", "other-tools", "kunge", name),
+			filepath.Join(exeDir, "资源", "上号器", name),
+			filepath.Join(exeDir, "..", "资源", "上号器", name),
+		}
+		cands = append(cands,
+			filepath.Join(exeDir, "资源", "上号器", "niubi", name),
+			filepath.Join(exeDir, "..", "资源", "上号器", "niubi", name),
+			filepath.Join(exeDir, "..", "..", "资源", "上号器", "niubi", name),
+		)
+		for _, c := range cands {
+			st, err := os.Stat(c)
+			if err != nil || st.Size() == 0 {
+				continue
+			}
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return "", err
+			}
+			if err := copyFileLocal(c, dst); err != nil {
+				return "", err
+			}
+			return dst, nil
+		}
+	}
+	return "", fmt.Errorf("本地没有 %s，请把它放到 %s", p.ExeName, dir)
+}
+
 // localLoaderReady 本地是否已有可用且校验通过的上号器；false 时返回原因便于排查。
 func localLoaderReady(dir string, p *loaderProfile) (bool, string) {
 	if p == nil {
 		return false, "未选择上号器类型"
+	}
+	if p.LocalOnly || p.NoHostDat {
+		st, err := os.Stat(filepath.Join(dir, p.ExeName))
+		if err != nil || st.Size() == 0 {
+			return false, "本地没有上号器文件（" + p.ExeName + "）"
+		}
+		return true, ""
 	}
 	m := readLoaderMarker(dir)
 	if m == nil || m.Meta.Exe == "" {
@@ -112,10 +185,25 @@ func syncLoader(ctx context.Context, dir string, p *loaderProfile, logf func(str
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	if p.LocalOnly {
+		exe, err := ensureLocalLoader(dir, p)
+		if err != nil {
+			return "", err
+		}
+		logf("上号器已就绪: %s（本地直供）", filepath.Base(exe))
+		return exe, nil
+	}
 
 	c := newCloudClient()
 	raw, err := c.download(ctx, loaderMetaPath(p.ID))
 	if err != nil {
+		// 云端还没发布时，本地有就直接用（开发者本机/离线包）
+		if p.NoHostDat {
+			if exe, e2 := ensureLocalLoader(dir, p); e2 == nil {
+				logf("云端暂无 %s，使用本地文件: %s", p.ExeName, filepath.Base(exe))
+				return exe, nil
+			}
+		}
 		if errors.Is(err, errCloudNotFound) {
 			return "", errors.New("云端还没有这个上号器的文件")
 		}
@@ -159,33 +247,35 @@ func syncLoader(ctx context.Context, dir string, p *loaderProfile, logf func(str
 	}
 
 	// 2) host.dat：缺失、或当前被本工具改成 127.0.0.1、或云端版本变了才写
-	needDat := false
-	if _, err := os.Stat(datPath); os.IsNotExist(err) {
-		needDat = true
-	} else if cur, err := DecryptHostDat(datPath); err != nil {
-		needDat = true
-	} else if strings.Contains(cur, "127.0.0.1") || strings.Contains(cur, "localhost") {
-		needDat = true
-	} else if m := readLoaderMarker(dir); m != nil && meta.DatSHA != "" && !strings.EqualFold(m.Meta.DatSHA, meta.DatSHA) {
-		needDat = true
-	}
-	if needDat {
-		data, err := c.download(ctx, loaderDatPath(p.ID))
-		if err != nil {
-			return "", fmt.Errorf("下载 host.dat 失败: %w", err)
+	if !p.NoHostDat {
+		needDat := false
+		if _, err := os.Stat(datPath); os.IsNotExist(err) {
+			needDat = true
+		} else if cur, err := DecryptHostDat(datPath); err != nil {
+			needDat = true
+		} else if strings.Contains(cur, "127.0.0.1") || strings.Contains(cur, "localhost") {
+			needDat = true
+		} else if m := readLoaderMarker(dir); m != nil && meta.DatSHA != "" && !strings.EqualFold(m.Meta.DatSHA, meta.DatSHA) {
+			needDat = true
 		}
-		if meta.DatSHA != "" {
-			sum := sha256.Sum256(data)
-			if !strings.EqualFold(hex.EncodeToString(sum[:]), meta.DatSHA) {
-				return "", errors.New("host.dat 校验失败，已丢弃")
+		if needDat {
+			data, err := c.download(ctx, loaderDatPath(p.ID))
+			if err != nil {
+				return "", fmt.Errorf("下载 host.dat 失败: %w", err)
 			}
+			if meta.DatSHA != "" {
+				sum := sha256.Sum256(data)
+				if !strings.EqualFold(hex.EncodeToString(sum[:]), meta.DatSHA) {
+					return "", errors.New("host.dat 校验失败，已丢弃")
+				}
+			}
+			if err := os.WriteFile(datPath, data, 0o600); err != nil {
+				return "", fmt.Errorf("写入 host.dat 失败: %w", err)
+			}
+			logf("已下载 host.dat")
+			// 旧备份作废，避免还原时把老版本写回去
+			_ = os.Remove(datPath + ".orig")
 		}
-		if err := os.WriteFile(datPath, data, 0o600); err != nil {
-			return "", fmt.Errorf("写入 host.dat 失败: %w", err)
-		}
-		logf("已下载 host.dat")
-		// 旧备份作废，避免还原时把老版本写回去
-		_ = os.Remove(datPath + ".orig")
 	}
 
 	// 3) 换了文件名的旧版本 exe 清掉

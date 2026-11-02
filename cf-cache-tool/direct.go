@@ -39,7 +39,8 @@ func runDirectLaunch(cfg *appConfig, card string) error {
 		Children: []Widget{
 			Label{Text: "游戏租号客户端", TextColor: walk.RGB(24, 96, 186), Font: Font{Family: "Microsoft YaHei", PointSize: 14, Bold: true}},
 			Label{AssignTo: &status, Text: "准备中…", Font: Font{PointSize: 10}},
-			Label{AssignTo: &detail, Text: card, TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+			// 加载窗口显示可视卡密（CG 开头 32 位），真卡密只在内部使用
+			Label{AssignTo: &detail, Text: renderCardKey(card), TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
 			VSpacer{},
 			Label{Text: "上号器退出后本窗口自动关闭", TextColor: walk.RGB(150, 150, 150), Font: Font{PointSize: 8}},
 		},
@@ -115,10 +116,10 @@ func doDirectLaunch(cfg *appConfig, card string, status func(string)) error {
 		}
 	}
 	if !found {
-		return fmt.Errorf("卡密平台里没有这个卡密：%s", card)
+		return fmt.Errorf("卡密平台里没有这个卡密：%s", renderCardKey(card))
 	}
 	if strings.TrimSpace(hit.QQ) == "" {
-		return fmt.Errorf("卡密 %s 还没有绑定 QQ", card)
+		return fmt.Errorf("卡密 %s 还没有绑定 QQ", renderCardKey(card))
 	}
 
 	status("正在准备上号数据…")
@@ -128,6 +129,27 @@ func doDirectLaunch(cfg *appConfig, card string, status func(string)) error {
 	d, e := ymmBuildOffline(api, []ymmRow{row}, card, false) // 卡密直登固定走在线接口
 	if e != nil {
 		return e
+	}
+
+	// 牛逼上号器：不读 config.ini / host.dat，用 WinHTTP 代理喂离线票据
+	if prof.NoHostDat {
+		text, qq, e := d.ticketFor(card)
+		if e != nil {
+			return e
+		}
+		zone := row.Area
+		if zone == "" {
+			zone = ymmZoneFromNote(row.Note)
+		}
+		if zone == "" {
+			zone = "河南一区"
+		}
+		status("正在启动上号器…")
+		if e := jigeLaunchOffline(launcher, text, qq, zone, func(s string, a ...any) { status(s) }); e != nil {
+			return e
+		}
+		status("上号器已退出，WinHTTP 代理已还原")
+		return nil
 	}
 
 	if _, _, e := writeOfflineConfig(filepath.Dir(launcher)); e != nil {
