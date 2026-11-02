@@ -151,7 +151,8 @@ func (m *ymmModel) Value(row, col int) interface{} {
 	r := m.rows[row]
 	switch col {
 	case 0:
-		return r.Note
+		// 备注里通常夹着卡密（编号----QQ----卡密----…），显示时一并换成可视卡密
+		return renderCardInText(r.Note)
 	case 1:
 		if r.Level < 0 {
 			return "-"
@@ -215,7 +216,7 @@ func histActionLabel(a string) string {
 }
 
 func histEntryMatch(e histEntry, kw string) bool {
-	for _, f := range []string{e.QQ, e.Card, e.Note, e.Zone, e.Result, histActionLabel(e.Action)} {
+	for _, f := range []string{e.QQ, e.Card, renderCardKey(e.Card), e.Note, e.Zone, e.Result, histActionLabel(e.Action)} {
 		if strings.Contains(strings.ToLower(f), kw) {
 			return true
 		}
@@ -733,7 +734,7 @@ func ymmRowMatch(r ymmRow, kw string) bool {
 		return true
 	}
 	for _, f := range []string{
-		r.Note, r.QQ, r.CardKey, r.QueryCode, r.Area, r.WarZone,
+		r.Note, r.QQ, r.CardKey, renderCardKey(r.CardKey), r.QueryCode, r.Area, r.WarZone,
 		r.Status, ymmStatusLabel(r.Status),
 	} {
 		if strings.Contains(strings.ToLower(f), kw) {

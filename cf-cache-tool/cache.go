@@ -77,12 +77,42 @@ func isKnownEndpoint(ep string) bool {
 	return false
 }
 
+// cardDirName 是卡密在 cache 下的目录名：存可视形态，磁盘上不出现真卡密。
+func cardDirName(card string) string { return sanitizeName(storeCardKey(card)) }
+
+// cacheCardDir 返回卡密的缓存目录：优先新形态，兼容老版本留下的明文目录。
+func cacheCardDir(cacheDir, card string) string {
+	dir := filepath.Join(cacheDir, cardDirName(card))
+	if _, err := os.Stat(dir); err == nil {
+		return dir
+	}
+	if legacy := filepath.Join(cacheDir, sanitizeName(card)); legacy != dir {
+		if _, err := os.Stat(legacy); err == nil {
+			return legacy
+		}
+	}
+	return dir
+}
+
+// removeCardDirs 把新老两种目录名都删掉，避免迁移前的老目录残留明文卡密。
+func removeCardDirs(cacheDir, card string) error {
+	dir := filepath.Join(cacheDir, cardDirName(card))
+	legacy := filepath.Join(cacheDir, sanitizeName(card))
+	err := os.RemoveAll(dir)
+	if legacy != dir {
+		if e := os.RemoveAll(legacy); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
 func (c *Cache) files(card, endpoint string) (bodyPath, metaPath string) {
-	dir := filepath.Join(c.Dir, sanitizeName(card))
+	dir := cacheCardDir(c.Dir, card)
 	return filepath.Join(dir, endpoint+".body"), filepath.Join(dir, endpoint+".meta.json")
 }
 
-// Load 读取缓存的响应体与元信息。
+// Load 读取缓存的响应体与元信息（meta 里的卡密还原成真卡密再返回）。
 func (c *Cache) Load(card, endpoint string) ([]byte, *Meta, error) {
 	bodyPath, metaPath := c.files(card, endpoint)
 	raw, err := os.ReadFile(metaPath)
@@ -93,6 +123,7 @@ func (c *Cache) Load(card, endpoint string) ([]byte, *Meta, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, nil, err
 	}
+	m.Card = loadCardKey(m.Card)
 	body, err := os.ReadFile(bodyPath)
 	if err != nil {
 		return nil, nil, err
@@ -100,17 +131,23 @@ func (c *Cache) Load(card, endpoint string) ([]byte, *Meta, error) {
 	return body, &m, nil
 }
 
-// Save 原子写入响应体与元信息。
+// Save 原子写入响应体与元信息；磁盘上的 card 字段写可视形态。
 func (c *Cache) Save(card, endpoint string, m *Meta, body []byte) error {
 	bodyPath, metaPath := c.files(card, endpoint)
 	if err := os.MkdirAll(filepath.Dir(bodyPath), 0o700); err != nil {
 		return err
 	}
-	m.Card = card
-	m.Endpoint = endpoint
-	m.Bytes = len(body)
-	m.RecordedAt = time.Now()
-	raw, err := json.MarshalIndent(m, "", "  ")
+	out := Meta{
+		Card:       storeCardKey(card),
+		Endpoint:   endpoint,
+		Status:     m.Status,
+		Header:     m.Header,
+		RecordedAt: time.Now(),
+		Bytes:      len(body),
+		// 请求体里有 card_key，落盘前一并换成可视卡密
+		Request: renderCardInText(m.Request),
+	}
+	raw, err := json.MarshalIndent(&out, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -129,9 +166,9 @@ func writeFileAtomic(path string, data []byte) error {
 	return os.Rename(tmp, path)
 }
 
-// Delete 删除某个卡密的全部缓存。
+// Delete 删除某个卡密的全部缓存（新老两种目录名都清）。
 func (c *Cache) Delete(card string) error {
-	return os.RemoveAll(filepath.Join(c.Dir, sanitizeName(card)))
+	return removeCardDirs(c.Dir, card)
 }
 
 // List 返回全部缓存元信息。
@@ -159,6 +196,7 @@ func (c *Cache) List() ([]Meta, error) {
 			}
 			var m Meta
 			if json.Unmarshal(raw, &m) == nil {
+				m.Card = loadCardKey(m.Card)
 				out = append(out, m)
 			}
 		}
@@ -201,7 +239,7 @@ func (c *Cache) ClearCard(card string) error {
 	if card == "" {
 		return nil
 	}
-	return os.RemoveAll(filepath.Join(c.Dir, sanitizeName(card)))
+	return removeCardDirs(c.Dir, card)
 }
 
 // ClearEndpoint 删除所有卡密目录下某个接口的缓存（boot 改成固定返回后用来清掉旧数据）。
@@ -238,14 +276,14 @@ func mergeRecording(staging, target string) (int, []string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		card := e.Name()
-		src := filepath.Join(staging, card)
+		card := loadCardKey(e.Name())
+		src := filepath.Join(staging, e.Name())
 		if _, err := os.Stat(filepath.Join(src, "api_card_redeem.body")); err != nil {
 			skipped = append(skipped, card)
 			continue
 		}
-		dst := filepath.Join(target, card)
-		if err := os.RemoveAll(dst); err != nil {
+		dst := filepath.Join(target, cardDirName(card))
+		if err := removeCardDirs(target, card); err != nil {
 			return merged, skipped, err
 		}
 		if err := os.MkdirAll(target, 0o700); err != nil {
@@ -303,7 +341,7 @@ func hasContent(dir string) bool {
 
 // hasLocalCard 判断本地是否已有该卡密的 redeem 缓存。
 func hasLocalCard(cacheDir, card string) bool {
-	_, err := os.Stat(filepath.Join(cacheDir, sanitizeName(card), "api_card_redeem.body"))
+	_, err := os.Stat(filepath.Join(cacheCardDir(cacheDir, card), "api_card_redeem.body"))
 	return err == nil
 }
 
@@ -319,7 +357,7 @@ func stagedCards(staging string) []string {
 			continue
 		}
 		if _, err := os.Stat(filepath.Join(staging, e.Name(), "api_card_redeem.body")); err == nil {
-			cards = append(cards, e.Name())
+			cards = append(cards, loadCardKey(e.Name()))
 		}
 	}
 	sort.Strings(cards)

@@ -56,6 +56,7 @@ func loadVerifySnaps() map[string]verifySnap {
 	}
 	for _, s := range list {
 		if s.QQ != "" {
+			s.Card = loadCardKey(s.Card)
 			out[s.QQ] = s
 		}
 	}
@@ -75,7 +76,7 @@ func saveVerifySnap(card string, st verifyStatus) {
 	all := loadVerifySnaps()
 	entry := verifySnap{
 		QQ:       qq,
-		Card:     card,
+		Card:     storeCardKey(card), // 落盘只存可视形态
 		Status:   st.Status,
 		Fenghao:  st.Fenghao,
 		Dongjie:  st.Dongjie,
@@ -88,7 +89,7 @@ func saveVerifySnap(card string, st verifyStatus) {
 		Daqu:     st.Daqu,
 		Zhanqu:   st.Zhanqu,
 		Zone:     st.Zone,
-		Message:  st.Message,
+		Message:  renderCardInText(st.Message), // 接口报错里可能回显卡密
 		At:       st.At.UnixMilli(),
 	}
 	if entry.At == 0 {

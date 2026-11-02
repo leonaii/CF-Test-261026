@@ -40,6 +40,8 @@ func appendHistory(dir string, e histEntry) {
 	if dir == "" {
 		return
 	}
+	e.Card = storeCardKey(e.Card)      // 落盘只存可视形态，不写明文卡密
+	e.Note = renderCardInText(e.Note) // 备注里也夹着卡密
 	b, err := json.Marshal(e)
 	if err != nil {
 		return
@@ -105,6 +107,7 @@ func loadHistory(dir string, limit int) []histEntry {
 		if json.Unmarshal([]byte(line), &e) != nil {
 			continue
 		}
+		e.Card = loadCardKey(e.Card)
 		out = append(out, e)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].TS > out[j].TS })
@@ -128,7 +131,7 @@ func deleteHistory(dir, card string, ts int64) error {
 	removed := 0
 	for _, line := range lines {
 		var e histEntry
-		if json.Unmarshal([]byte(line), &e) == nil && e.Card == card && e.TS == ts {
+		if json.Unmarshal([]byte(line), &e) == nil && loadCardKey(e.Card) == card && e.TS == ts {
 			removed++
 			continue
 		}

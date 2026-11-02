@@ -192,7 +192,7 @@ func verifySummary(st verifyStatus) string {
 // verifyDetailText 生成详情窗口文本：先给摘要，再给完整原始响应。
 func verifyDetailText(row accountRow) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "卡密：%s\r\n", row.Card)
+	fmt.Fprintf(&b, "卡密：%s\r\n", renderCardKey(row.Card))
 	if row.QQ != "" && row.QQ != "-" {
 		fmt.Fprintf(&b, "QQ：%s\r\n", row.QQ)
 	}

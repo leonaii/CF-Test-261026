@@ -97,7 +97,7 @@ func loadAccountRows(c *Cache) []accountRow {
 		recorded := m.RecordedAt
 		if recorded.IsZero() {
 			// 老缓存/手工拷贝可能没有 recorded_at，退回文件修改时间，保证“最新在前”仍然成立
-			metaPath := filepath.Join(c.Dir, sanitizeName(m.Card), m.Endpoint+".meta.json")
+			metaPath := filepath.Join(cacheCardDir(c.Dir, m.Card), m.Endpoint+".meta.json")
 			if st, err := os.Stat(metaPath); err == nil {
 				recorded = st.ModTime()
 			}

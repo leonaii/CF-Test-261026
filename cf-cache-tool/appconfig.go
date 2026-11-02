@@ -4,6 +4,7 @@ package main
 // 存在 %AppData%\CG\config.json，换目录/换机器互不影响。
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -41,15 +42,19 @@ func markLabel(id string) string {
 }
 
 type appConfig struct {
-	Profile   string            `json:"profile"`
-	WorkDir   string            `json:"work_dir"`
-	GameDir   string            `json:"game_dir,omitempty"` // 自研上号：用户选过的游戏目录
-	CloudName string            `json:"cloud_name"`
+	Profile    string            `json:"profile"`
+	ProfileVer int               `json:"profile_ver,omitempty"` // 老配置迁移标记
+	WorkDir    string            `json:"work_dir"`
+	GameDir    string            `json:"game_dir,omitempty"` // 自研上号：用户选过的游戏目录
+	CloudName  string            `json:"cloud_name"`
 	AutoCloud  bool              `json:"auto_cloud"`
 	ProxyOn    *bool             `json:"proxy_on,omitempty"`    // nil = 默认开启
 	DataSource string            `json:"data_source,omitempty"` // "" / online / dav
 	Marks      map[string]string `json:"marks,omitempty"`
 }
+
+// defaultProfileID 是默认上号器：牛逼上号器（本地直登）。
+const defaultProfileID = "2"
 
 func configDirPath() string {
 	d, err := os.UserConfigDir() // Windows: %AppData%
@@ -72,11 +77,51 @@ func loadAppConfig() *appConfig {
 	if json.Unmarshal(raw, &c) != nil {
 		return nil
 	}
+	// 默认上号器升级为「牛逼」：只迁移一次，用户之后手动改回圆梦不会再被覆盖
+	if c.ProfileVer < 2 {
+		c.Profile = defaultProfileID
+		c.ProfileVer = 2
+		_ = c.save()
+	}
+	// 配置里只存可视卡密：读进来还原成真卡密，老文件顺手改写成可视形态
+	c.normalizeCards()
+	disk := c.diskView()
+	if b, err := json.MarshalIndent(&disk, "", "  "); err == nil && !bytes.Equal(b, raw) {
+		_ = c.save()
+	}
 	return &c
 }
 
+// normalizeCards 把配置里的可视卡密还原成真卡密（内存里一律用真卡密）。
+func (c *appConfig) normalizeCards() {
+	c.CloudName = loadCardKey(c.CloudName)
+	if len(c.Marks) == 0 {
+		return
+	}
+	m := make(map[string]string, len(c.Marks))
+	for k, v := range c.Marks {
+		m[loadCardKey(k)] = v
+	}
+	c.Marks = m
+}
+
+// diskView 返回落盘用的副本：cloud_name 与 marks 的键都换成可视卡密。
+func (c *appConfig) diskView() appConfig {
+	cp := *c
+	cp.CloudName = storeCardKey(c.CloudName)
+	if len(c.Marks) > 0 {
+		m := make(map[string]string, len(c.Marks))
+		for k, v := range c.Marks {
+			m[storeCardKey(k)] = v
+		}
+		cp.Marks = m
+	}
+	return cp
+}
+
 func (c *appConfig) save() error {
-	raw, err := json.MarshalIndent(c, "", "  ")
+	disk := c.diskView()
+	raw, err := json.MarshalIndent(&disk, "", "  ")
 	if err != nil {
 		return err
 	}

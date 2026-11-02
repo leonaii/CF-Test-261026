@@ -343,7 +343,8 @@ func unpackCache(data []byte, cacheDir string) (int, error) {
 		}
 	}
 	for card := range cards {
-		_ = os.RemoveAll(filepath.Join(cacheDir, card))
+		// 备份 zip 内部还是真卡密目录名，落地时统一换成可视形态
+		_ = removeCardDirs(cacheDir, loadCardKey(card))
 	}
 
 	count := 0
@@ -358,7 +359,7 @@ func unpackCache(data []byte, cacheDir string) (int, error) {
 		if !strings.HasSuffix(name, ".body") && !strings.HasSuffix(name, ".meta.json") {
 			continue
 		}
-		dst := filepath.Join(cacheDir, filepath.FromSlash(name))
+		dst := filepath.Join(cacheDir, filepath.FromSlash(storedCacheRel(name)))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
 			return count, err
 		}
@@ -379,7 +380,23 @@ func unpackCache(data []byte, cacheDir string) (int, error) {
 		}
 		count++
 	}
+	// 备份里的 meta 可能还是明文卡密，落地时统一改写
+	migrateCardDirs(cacheDir)
 	return count, nil
+}
+
+// storedCacheRel 把备份 zip 里的相对路径首段（真卡密）换成可视形态目录名。
+func storedCacheRel(name string) string {
+	if i := strings.IndexByte(name, '/'); i > 0 {
+		seg := name[:i]
+		if card, ok := decodeCardKey(seg); ok {
+			return cardDirName(card) + name[i:]
+		}
+		if looksLikeCard(seg) {
+			return cardDirName(seg) + name[i:]
+		}
+	}
+	return name
 }
 
 // cloudBackup 上传本地缓存，返回文件数与字节数。

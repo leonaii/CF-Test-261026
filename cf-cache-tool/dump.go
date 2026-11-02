@@ -272,7 +272,8 @@ func ensureDumpCards(logf func(string, ...any)) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(out, gz); err != nil {
+	// 落盘前把卡密换成可视形态：本地离线列表里不出现明文卡密
+	if err := writeDumpCards(out, gz); err != nil {
 		out.Close()
 		_ = os.Remove(tmp)
 		return "", err
@@ -343,6 +344,7 @@ func dumpRows(dir string, f ymmFilter, keyword string) ([]ymmRow, int, error) {
 			continue
 		}
 		it := cardItemFromMap(obj)
+		it.CardKey = loadCardKey(it.CardKey) // 磁盘上存的是可视卡密
 		total++
 		if f.Status != "" && f.Status != "all" && it.Status != f.Status {
 			continue

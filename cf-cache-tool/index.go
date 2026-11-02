@@ -114,7 +114,7 @@ func putCloudIndex(ctx context.Context, name, pid string, idx *cloudIndex) error
 
 // packCardDir 把 cache/<card>/ 下的缓存文件打成 zip（内部仍用 card/ 前缀）。
 func packCardDir(cacheDir, card string) ([]byte, int, error) {
-	dir := filepath.Join(cacheDir, sanitizeName(card))
+	dir := cacheCardDir(cacheDir, card)
 	st, err := os.Stat(dir)
 	if err != nil || !st.IsDir() {
 		return nil, 0, errors.New("本地没有该卡密的缓存")
@@ -174,8 +174,8 @@ func unpackCardZip(cacheDir, card string, data []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("云端数据不是有效 zip: %w", err)
 	}
-	dst := filepath.Join(cacheDir, sanitizeName(card))
-	_ = os.RemoveAll(dst)
+	dst := filepath.Join(cacheDir, cardDirName(card))
+	_ = removeCardDirs(cacheDir, card)
 	if err := os.MkdirAll(dst, 0o700); err != nil {
 		return 0, err
 	}
@@ -209,6 +209,8 @@ func unpackCardZip(cacheDir, card string, data []byte) (int, error) {
 		_ = os.RemoveAll(dst)
 		return 0, errors.New("云端缓存缺少 redeem 数据，可能不完整")
 	}
+	// 云端 zip 里的 meta 可能还是明文卡密，落地时统一改写
+	rewriteMetaCards(dst, card)
 	return count, nil
 }
 
