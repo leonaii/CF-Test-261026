@@ -403,6 +403,11 @@ func selfNTHex32(b []byte) bool {
 // selfNTParseFirstAuthResponse 对应 sub_1400568C0：优先取 field4 的 32 位 hex sig。
 func selfNTParseFirstAuthResponse(plain []byte) (string, error) {
 	if payload, err := selfNTExtractPayload(plain); err == nil && len(payload) > 0 {
+		for i := 1; i <= 10; i++ {
+			if b, _ := selfNTKexBytesField(payload, uint64(i)); len(b) > 0 {
+				selfLog("FIRST_AUTH field%d len=%d val=%s", i, len(b), selfClip(selfSanitize(string(b)), 220))
+			}
+		}
 		if b, _ := selfNTKexBytesField(payload, 4); selfNTHex32(b) {
 			return strings.ToUpper(string(b)), nil
 		}

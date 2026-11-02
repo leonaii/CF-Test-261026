@@ -20,8 +20,21 @@ func selfReadCFGamest(dir string) (*selfGameTicketData, string, error) {
 			return nil, "", err
 		}
 	}
-	p := filepath.Join(dir, selfGameRelDir, "CF_Gamest")
-	raw, err := os.ReadFile(p)
+	paths := []string{
+		filepath.Join(dir, "x64", "CF_Gamest"),
+		filepath.Join(dir, "CF_Gamest"),
+		filepath.Join(dir, selfGameRelDir, "CF_Gamest"),
+	}
+	p := paths[0]
+	var raw []byte
+	var err error
+	for _, cand := range paths {
+		raw, err = os.ReadFile(cand)
+		if err == nil {
+			p = cand
+			break
+		}
+	}
 	if err != nil {
 		return nil, p, fmt.Errorf("读不到 CF_Gamest（需先用上号器登录一次）: %w", err)
 	}

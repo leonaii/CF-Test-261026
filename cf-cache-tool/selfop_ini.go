@@ -64,16 +64,28 @@ func selfParseOPPlain(plain []byte, tk *ymmTicket) (*selfGameTicketData, error) 
 		return s
 	}
 
+	uin := firstNonEmpty(str("uin"), tk.QQ)
+	if uin == "0" {
+		uin = tk.QQ
+	}
 	data := &selfGameTicketData{
-		Uin:       firstNonEmpty(str("uin"), tk.QQ),
-		Tgpid:     firstNonEmpty(str("tgpid", "tgp_id"), tk.Tgpid),
-		OpenID:    str("openid"),
-		OpenKey:   str("open_key", "openkey"),
+		Uin:    uin,
+		Tgpid:  firstNonEmpty(str("tgpid", "tgp_id"), tk.Tgpid),
+		OpenID: str("openid"),
+		// EP 里没有 open_key 时，qq_info.st_key 与离线器 CF_Gamest 的
+		// open_key 同为 32 位大写 hex；样本写的就是这个值。
+		OpenKey:   firstNonEmpty(str("open_key", "openkey"), str("st_key")),
 		CTT:       str("game_client_key", "ctt"),
 		GameST:    str("game_st"),
 		GameSTKey: str("game_st_key"),
 		PfKey:     str("pf_key"),
 		ClientKey: str("client_key"),
+		STKey:     str("st_key"),
+		QQInfoSig: str("sig"),
+		SK:        str("sk"),
+		CT:        str("ct"),
+		DT:        str("dt"),
+		BizTicket: str("biz_ticket"),
 	}
 	if data.OpenID == "" {
 		code := firstNonEmpty(str("error_code"), "-")
@@ -173,6 +185,15 @@ func selfLoginByIni(tk *ymmTicket, saveDir string) (*selfGameTicketData, error) 
 
 	data, err := attempt(stk)
 	if err == nil {
+		// type4 的 _ep 只给 openid/client_key/st_key，没有真实 open_key。
+		// 样本拿到这些字段后再走一次 qq_info_type=6，才有 open_key。
+		if data.ClientKey != "" && data.STKey != "" && (data.OpenKey == "" || data.OpenKey == data.STKey) {
+			if v6, e := selfLoginV6FromTicket(stk, tk, data, saveDir); e == nil {
+				return v6, nil
+			} else {
+				selfLog("V6 二次登录失败 QQ=%s: %v", tk.QQ, e)
+			}
+		}
 		return data, nil
 	}
 	if !strings.Contains(err.Error(), "8010170") {
@@ -182,6 +203,49 @@ func selfLoginByIni(tk *ymmTicket, saveDir string) (*selfGameTicketData, error) 
 	// mcode 与设备绑定：mid_list 里的 blob 是从 selfTemplateMachineID 那台机抓的
 	stk.MachineID = selfTemplateMachineID
 	return attempt(stk)
+}
+
+// selfLoginV6FromTicket 用 type4 返回的 openid/client_key/st_key/ctt/dt/sk
+// 再执行样本的 qq_info_type=6 LoginByQq，换取真实 open_key。
+func selfLoginV6FromTicket(stk *selfTicket, tk *ymmTicket, d *selfGameTicketData, saveDir string) (*selfGameTicketData, error) {
+	v6 := *stk
+	v6.Raw = make(map[string]string, len(stk.Raw)+8)
+	for k, v := range stk.Raw {
+		v6.Raw[k] = v
+	}
+	v6.UID = firstNonEmpty(d.Tgpid, tk.Tgpid, stk.UID)
+	// head.credential.ct 用原始卡密 ct；d.CT 是 type4 回包的新 ct，
+	// 填进去会 8010014 认证失败。
+	v6.CT = firstNonEmpty(stk.CT, d.CT)
+	if d.QQInfoSig != "" {
+		v6.Sig = d.QQInfoSig
+	}
+	v6.Raw["openid"] = d.OpenID
+	v6.Raw["client_key"] = d.ClientKey
+	v6.Raw["st_key"] = d.STKey
+	v6.Raw["ctt"] = d.CTT
+	v6.Raw["dt"] = d.DT
+	v6.Raw["sk"] = d.SK
+	v6.Raw["biz_ticket"] = d.BizTicket
+	res, err := selfLoginByQqV6(&v6, saveDir)
+	if err != nil {
+		return nil, err
+	}
+	selfLog("V6 回包 %s", selfClip(selfSanitize(string(res.Plain)), 600))
+	out, err := selfLoginResultData(res, tk)
+	if err != nil {
+		return nil, err
+	}
+	if out.OpenKey == "" {
+		return nil, errors.New("V6 回包仍没有 open_key")
+	}
+	if out.OpenID == "" {
+		out.OpenID = d.OpenID
+	}
+	if out.Tgpid == "" {
+		out.Tgpid = d.Tgpid
+	}
+	return out, nil
 }
 
 // parseYmmTicket 把卡密平台下发的 NT 缓存（首行 [QQ]，之后 Key=Value）解析成 ymmTicket。
@@ -309,7 +373,7 @@ func selfGetGameTicketFromIni(t *ymmTicket, ck string, qq string) (*selfGameTick
 		Uin:     qq,
 		Tgpid:   t.Tgpid,
 		OpenID:  pick("openid", "open_id"),
-		OpenKey: pick("open_key", "openkey"),
+		OpenKey: firstNonEmpty(pick("open_key", "openkey"), pick("st_key")),
 		CTT:     pick("ctt", "game_client_key"),
 		PfKey:   pick("pf_key"),
 	}

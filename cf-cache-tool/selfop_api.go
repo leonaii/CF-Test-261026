@@ -66,7 +66,8 @@ func selfBuildLoginPlainV6(t *selfTicket, midList string) string {
 			`"config_params":{"lang_type":0,"login_type":1,"channel_id":0,"promote_id":"0",`+
 			`"client_version":"%s","client_dev_name":"%s"},`+
 			`"head":{"credential":{"game_ver":"","ct":"%s","ctt":"%s","dt":"%s","sk":"%s","mid_list":"%s","wg_client_ver":"%s"}}}`,
-		selfMappid, selfClientType, selfAppID, firstNonEmpty(t.UID, t.QQ), t.Sig,
+		selfMappid, selfClientType, selfAppID,
+		firstNonEmpty(t.UID, t.QQ), t.Sig,
 		strings.TrimSpace(t.Raw["client_key"]), strings.TrimSpace(t.Raw["st_key"]),
 		selfWGClientVer, t.ClientDevName(),
 		t.CT, strings.TrimSpace(t.Raw["ctt"]), strings.TrimSpace(t.Raw["dt"]), strings.TrimSpace(t.Raw["sk"]),
@@ -98,6 +99,7 @@ func selfLoginByQqPlain(t *selfTicket, useOpenID bool, saveDir string, encrypt b
 	plain := selfBuildLoginPlain(t, midList)
 	if useOpenID {
 		plain = selfBuildLoginPlainV6(t, midList)
+		selfLog("V6 请求 %s", selfClip(selfSanitize(plain), 800))
 	}
 	nonce, err := selfNewNonce()
 	if err != nil {

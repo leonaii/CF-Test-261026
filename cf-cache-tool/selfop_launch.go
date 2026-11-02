@@ -15,15 +15,17 @@ package main
 // 其中 1/2/3/6 是必需项；4/5/7 是上号器附加的"假 Rail"通道。
 
 import (
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -39,15 +41,22 @@ const (
 
 // selfGameTicketData 是写进 CF_Gamest 的字段。
 type selfGameTicketData struct {
-	Uin      string // QQ
-	Tgpid    string // uid
-	OpenID   string
-	OpenKey  string
-	PfKey    string
-	CTT      string // game_client_key 与 ctt 相同
-	GameST   string
+	Uin       string // QQ
+	Tgpid     string // uid
+	Zone      string // 卡密备注里的大区名
+	OpenID    string
+	OpenKey   string
+	PfKey     string
+	CTT       string // game_client_key 与 ctt 相同
+	GameST    string
 	GameSTKey string
 	ClientKey string
+	STKey     string // qq_info.st_key，用于 qq_info_type=6 二次登录
+	QQInfoSig string
+	SK        string
+	CT        string
+	DT        string
+	BizTicket string
 }
 
 // selfGameDir 从注册表读游戏安装目录。
@@ -111,32 +120,193 @@ func selfWriteMmogXML(dir, qq string) (string, error) {
 	return p, nil
 }
 
-// selfWriteCFGamest 写 TCLS\CF_Gamest（纯文本票据，行序与上号器一致）。
+// selfPatchMmogXMLs 对应样本 sub_14001AEE0 的四个 mmog_data.xml 改写：
+// 保留原文件格式，只把 <Uin> 换成当前 QQ；WorldID 不动。
+func selfPatchMmogXMLs(dir, qq string) {
+	for _, rel := range []string{
+		`NTCLS\mmog_data.xml`,
+		`NTCLS\ntcls_config\mmog_data.xml`,
+		`NTCLS\tgp_config\mmog_data.xml`,
+	} {
+		p := filepath.Join(dir, rel)
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		s := string(raw)
+		if next, ok := selfReplaceXMLTag(s, "Uin", qq); ok {
+			if err := os.WriteFile(p, []byte(next), 0o644); err == nil {
+				selfLog("mmog Uin 已写 %s", p)
+			}
+		}
+	}
+	// 样本 SHCreateDirectoryExW(<base>\rail_user_data\2)。
+	// <base> 是 WeGameApps 根，不是游戏目录；两处都建，兼容不同版本。
+	_ = os.MkdirAll(filepath.Join(dir, "rail_user_data", "2"), 0o755)
+	weGamRoot := filepath.Dir(filepath.Dir(dir))
+	_ = os.MkdirAll(filepath.Join(weGamRoot, "rail_user_data", "2"), 0o755)
+}
+
+func selfReplaceXMLTag(s, tag, val string) (string, bool) {
+	open, close := "<"+tag+">", "</"+tag+">"
+	i := strings.Index(s, open)
+	if i < 0 {
+		return s, false
+	}
+	start := i + len(open)
+	j := strings.Index(s[start:], close)
+	if j < 0 {
+		return s, false
+	}
+	return s[:start] + val + s[start+j:], true
+}
+
+// selfCFTicketBase64 把 OP 的 hex ctt 转成离线器 CF_Gamest 的 Base64 格式。
+// 非 hex 或长度异常时原样返回，避免破坏已经是 Base64 的票据。
+func selfCFTicketBase64(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) < 32 || len(s)%2 != 0 {
+		return s
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+			return s
+		}
+	}
+	raw, err := hex.DecodeString(s)
+	if err != nil {
+		return s
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+// selfWriteCFGamest 按离线器 14:35 实际落盘位置写票据：
+// <game>\CF_Gamest 和 <game>\x64\CF_Gamest；TCLS 仅作兼容。
+// 只写 TCLS 会让 x64 里的旧账号票据继续生效，导致 2310。
 func selfWriteCFGamest(dir string, t *selfGameTicketData) (string, error) {
-	p := filepath.Join(dir, selfGameRelDir, "CF_Gamest")
+	// 离线器 CF_Gamest 里的 game_client_key/ctt 是 Base64；OP 回包给的是 hex。
+	// 直接写 hex，游戏按 Base64 解会失败并 2310。
+	gck := selfCFTicketBase64(t.CTT)
 	var b strings.Builder
 	fmt.Fprintf(&b, "uin=%s\n", t.Uin)
 	fmt.Fprintf(&b, "tgpid=%s\n", t.Tgpid)
 	fmt.Fprintf(&b, "openid=%s\n", t.OpenID)
 	fmt.Fprintf(&b, "open_key=%s\n", t.OpenKey)
 	fmt.Fprintf(&b, "pf_key=%s\n", t.PfKey)
-	fmt.Fprintf(&b, "game_client_key=%s\n", t.CTT)
+	fmt.Fprintf(&b, "game_client_key=%s\n", gck)
 	fmt.Fprintf(&b, "game_st=%s\n", t.GameST)
 	fmt.Fprintf(&b, "game_st_key=%s\n", t.GameSTKey)
 	fmt.Fprintf(&b, "client_key=%s\n", t.ClientKey)
-	fmt.Fprintf(&b, "ctt=%s\n", t.CTT)
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return "", err
+	fmt.Fprintf(&b, "ctt=%s\n", gck)
+	body := []byte(b.String())
+	paths := []string{
+		filepath.Join(dir, "CF_Gamest"),
+		filepath.Join(dir, "x64", "CF_Gamest"),
+		filepath.Join(dir, selfGameRelDir, "CF_Gamest"),
 	}
-	if err := os.WriteFile(p, []byte(b.String()), 0o644); err != nil {
-		return "", err
+	for _, p := range paths {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return "", err
+		}
+		if err := os.WriteFile(p, body, 0o644); err != nil {
+			return "", err
+		}
+		selfLog("写 CF_Gamest %s", p)
 	}
-	return p, nil
+	return paths[1], nil
 }
 
-// selfCreateSharedMem 创建 544 字节共享内存：+0 uint32=2，+4 WCHAR[]=QQ，+0x20C uint64。
-// 返回句柄与视图指针，调用方负责释放。
-func selfCreateSharedMem(qq string) (syscall.Handle, uintptr, error) {
+// selfEnsureVersionIni 不写 version.ini，保留离线器的现有值。
+// 样本 sub_14001AEE0 写的是 SSN=-rotate:0 -SSN:<动态区号> -cf:1。
+// 区号错误会导致游戏初始化时 Rail 2310；离线器每次运行会重写，我们不该覆盖。
+func selfEnsureVersionIni(dir string) {
+	// 当前跳过不写，改为只校验文件存在；如果缺失则由离线器或用户手动补。
+	// 也可以读取现有 version.ini 的 SSN 值并保持。暂时不处理。
+}
+
+// selfKillWeGame 对应样本 sub_1400099D0：清理 WeGame 客户端/启动器，避免它抢 Rail。
+func selfKillWeGame() {
+	k32 := syscall.NewLazyDLL("kernel32.dll")
+	openProc := k32.NewProc("OpenProcess")
+	terminate := k32.NewProc("TerminateProcess")
+	waitFor := k32.NewProc("WaitForSingleObject")
+	closeHandle := k32.NewProc("CloseHandle")
+	for _, p := range selfProcessList() {
+		name := strings.ToLower(p.name)
+		if name != "wegame.exe" && name != "wegamelauncher.exe" {
+			continue
+		}
+		h, _, err := openProc.Call(uintptr(p.pid), 0, 0x100001) // TERMINATE|SYNCHRONIZE
+		if h == 0 {
+			selfLog("清理 WeGame pid=%d OpenProcess 失败: %v", p.pid, err)
+			continue
+		}
+		ok, _, terr := terminate.Call(h, 0)
+		waitFor.Call(h, 150)
+		closeHandle.Call(h)
+		if ok != 0 {
+			selfLog("已清理 WeGame pid=%d", p.pid)
+		} else {
+			selfLog("清理 WeGame pid=%d 失败: %v", p.pid, terr)
+		}
+	}
+}
+
+// selfKillExistingCrossfire 对应样本 sub_140009860：
+// 启动前枚举 crossfire.exe / crossfire_x64.exe，清理残留进程，最多等 2.5 秒。
+// 不清理旧进程时，新进程会被单实例/互斥量顶成 2310。
+func selfKillExistingCrossfire() {
+	k32 := syscall.NewLazyDLL("kernel32.dll")
+	openProc := k32.NewProc("OpenProcess")
+	terminate := k32.NewProc("TerminateProcess")
+	waitFor := k32.NewProc("WaitForSingleObject")
+	closeHandle := k32.NewProc("CloseHandle")
+
+	kill := func() int {
+		n := 0
+		for _, p := range selfProcessList() {
+			if !strings.EqualFold(p.name, "crossfire.exe") && !strings.EqualFold(p.name, "crossfire_x64.exe") {
+				continue
+			}
+			h, _, err := openProc.Call(uintptr(p.pid), 0, 0x100001) // TERMINATE|SYNCHRONIZE
+			if h == 0 {
+				selfLog("清理旧 crossfire pid=%d OpenProcess 失败: %v", p.pid, err)
+				continue
+			}
+			ok, _, terr := terminate.Call(h, 0)
+			waitFor.Call(h, 150)
+			closeHandle.Call(h)
+			if ok != 0 {
+				n++
+				selfLog("已清理旧 crossfire pid=%d", p.pid)
+			} else {
+				selfLog("清理旧 crossfire pid=%d 失败: %v", p.pid, terr)
+			}
+		}
+		return n
+	}
+	kill()
+	deadline := time.Now().Add(2500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		found := false
+		for _, p := range selfProcessList() {
+			if strings.EqualFold(p.name, "crossfire.exe") || strings.EqualFold(p.name, "crossfire_x64.exe") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// selfCreateSharedMem 创建 544 字节共享内存：
+// +0 uint32=2，+4 WCHAR[]=rail_api64.dll 完整路径，+0x20C uint64=WE_GAME_SDK 窗口句柄。
+// IDA: sub_14001AEE0 0x14001BBA6 写 v164[0]；v164 随后赋给 FileName，
+// sub_14000F440 用 _wfopen(FileName) 按 PE 解析，所以它只能是 rail 路径，不是 QQ。
+func selfCreateSharedMem(railDLL string) (syscall.Handle, uintptr, error) {
 	k32 := syscall.NewLazyDLL("kernel32.dll")
 	createMap := k32.NewProc("CreateFileMappingW")
 	mapView := k32.NewProc("MapViewOfFile")
@@ -146,7 +316,7 @@ func selfCreateSharedMem(qq string) (syscall.Handle, uintptr, error) {
 	name, _ := syscall.UTF16PtrFromString(fmt.Sprintf(selfSharedMemFmt, selfSharedMemName()))
 	h, _, err := createMap.Call(
 		uintptr(syscall.InvalidHandle), // INVALID_HANDLE_VALUE = 页文件
-		0, 0, 0, uintptr(0x220),
+		0, 4, 0, uintptr(0x220),        // flProtect=PAGE_READWRITE，样本 0x14001BB11 传 4
 		uintptr(unsafe.Pointer(name)),
 	)
 	if h == 0 {
@@ -162,10 +332,10 @@ func selfCreateSharedMem(qq string) (syscall.Handle, uintptr, error) {
 		mem[i] = 0
 	}
 	binary.LittleEndian.PutUint32(mem[0:4], 2)
-	// +4 起写 UTF-16 QQ，最多 129 个 WCHAR
-	q := syscall.StringToUTF16(qq)
-	for i := 0; i < len(q) && 4+i*2+1 < 0x20C; i++ {
-		binary.LittleEndian.PutUint16(mem[4+i*2:], q[i])
+	// +4 起写 UTF-16 rail_api64.dll 完整路径，最多 129 个 WCHAR。
+	rail := syscall.StringToUTF16(railDLL)
+	for i := 0; i < len(rail) && 4+i*2+1 < 0x20C; i++ {
+		binary.LittleEndian.PutUint16(mem[4+i*2:], rail[i])
 	}
 	// +0x20C 写 Rail host 窗口句柄（样本 0x14001BBAB: mov [rsi+20Ch], rdi）。
 	// rail_api64 从这里取 HWND 再去找窗口；不写就是 0 → 初始化失败 → 2310。
@@ -193,76 +363,117 @@ func selfLaunchGame(dir string, t *selfGameTicketData) (int, error) {
 	if _, err := os.Stat(exe); err != nil {
 		return 0, fmt.Errorf("找不到游戏主程序: %w", err)
 	}
+	// 样本 sub_14001AEE0 读现有 CF_Gamest 的 uin= 直接启动；
+	// 离线器 16:02 已经为当前账号写入有效 open_key/ctt，不能再被我们的
+	// 二次登录票据覆盖，否则覆盖后立刻 2310。
+	reuseGamest := false
+	if old, p, err := selfReadCFGamest(dir); err == nil &&
+		strings.TrimSpace(old.Uin) == strings.TrimSpace(t.Uin) &&
+		strings.TrimSpace(old.OpenKey) != "" && strings.TrimSpace(old.CTT) != "" {
+		selfLog("复用现有 CF_Gamest %s uin=%s open_key=%s", p, old.Uin, old.OpenKey)
+		t = old
+		reuseGamest = true
+	}
+
 	selfLog("==== 启动 start dir=%s exe=%s", dir, exe)
+	ssn := selfResolveSSN(dir, t.Zone)
+	selfWriteVersionIni(dir, ssn)
+	selfLoadRailHello(t.Uin, t.Tgpid, ssn)
 
 	if _, err := selfWriteMmogXML(dir, t.Uin); err != nil {
 		selfLog("写 mmog_data.xml 失败: %v", err)
 		return 0, fmt.Errorf("写 mmog_data.xml 失败: %w", err)
 	}
-	if _, err := selfWriteCFGamest(dir, t); err != nil {
-		selfLog("写 CF_Gamest 失败: %v", err)
-		return 0, fmt.Errorf("写 CF_Gamest 失败: %w", err)
+	selfPatchMmogXMLs(dir, t.Uin)
+	if !reuseGamest {
+		if _, err := selfWriteCFGamest(dir, t); err != nil {
+			selfLog("写 CF_Gamest 失败: %v", err)
+			return 0, fmt.Errorf("写 CF_Gamest 失败: %w", err)
+		}
 	}
-	selfLog("票据文件已写 qq=%s hasSig=%v", t.Uin, t.GameSTKey != "")
+	selfLog("票据文件已写 qq=%s hasSig=%v reuse=%v", t.Uin, t.GameSTKey != "", reuseGamest)
 
 	// 共享内存必须活到游戏退出，不能像之前那样 defer 掉。
 	// Rail 在初始化后会反复读这块内存，提前 Unmap 会让它 2310。
-	if h, v, err := selfCreateSharedMem(t.Uin); err == nil {
+	if h, v, err := selfCreateSharedMem(selfGameRailDLL(dir)); err == nil {
 		selfHoldSharedMem(h, v)
 		selfLog("共享内存 ok name=Rail.SharedMemory.%d hwnd=%#x view=%#x", selfSharedMemName(), selfEnsureRailWindow(), v)
 	} else {
 		selfLog("共享内存失败: %v", err)
 	}
 
-	// 管道：host 侧名字带自己的 PID（rail_named_pipe_host_<pid>），
-	// 游戏起来后会创建 rail_named_pipe_guest_<gamePid>，我们作为 host 去连。
-	pipeStop := selfServeHostPipe()
-
-	cmd := exec.Command(exe)
-	cmd.Dir = filepath.Dir(exe)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CmdLine:       fmt.Sprintf(`"%s" %s`, exe, selfGameArgs),
-		CreationFlags: 0x00000400, // CREATE_UNICODE_ENVIRONMENT
+	// 样本顺序：先把 qwh_cf_hook.dll 落盘，再 CreateProcess。
+	// 当前代码以前在启动后才写，游戏已经开始初始化 Rail，来不及。
+	base := filepath.Dir(exe)
+	dll, err := selfEnsureHookDLL(base)
+	if err != nil {
+		selfLog("释放 hook dll 失败: %v", err)
+		return 0, fmt.Errorf("释放 hook dll 失败: %w", err)
 	}
-	if err := cmd.Start(); err != nil {
-		selfLog("CreateProcess 失败: %v", err)
-		pipeStop()
+	selfLog("hook dll=%s", dll)
+
+	// 不主动注入：离线器是等游戏发 inject_hook cmd=1 后才注入。
+	// 先把 dll 路径挂到全局，游戏一连上静态管道就可能立刻发 cmd=1。
+	selfResetHookInjection()
+	selfHookPath = dll
+
+	// 样本先建 4 个 *_15 静态管道，CreateProcess 后再建游戏 PID 的 8 个动态管道。
+	staticStop := selfServeStaticRailPipes()
+	proc, err := selfStartGame(exe, filepath.Dir(exe), selfGameArgs)
+	if err != nil {
+		staticStop()
+		selfLog("CreateProcessW 失败: %v", err)
 		return 0, fmt.Errorf("启动游戏失败: %w", err)
 	}
-	pid := cmd.Process.Pid
-	selfLog("CreateProcess ok pid=%d cmdline=\"%s\"", pid, cmd.SysProcAttr.CmdLine)
+	pid := int(proc.ProcessID)
+	selfLog("CreateProcessW ok pid=%d", pid)
 
-	// 作为 host 连游戏的 guest 管道（游戏自己创建，名字带它的 PID）
-	selfConnectGuestPipe(pid)
+	// 句柄必须在启动动态管道前挂好，否则 cmd=1 可能先到。
+	selfHookProcHandle = proc.Process
+	selfHookGamePID = pid
+	selfLog("等待游戏 inject_hook cmd=1 pid=%d", pid)
 
-	// 注入 Hook DLL（上号器在第 7 步做，缺这一步 Rail 仍会 2310）
-	//
-	// 注意 base：样本 sub_140019270 是先拼 "<base>\crossfire.exe" 再落到
-	// "<base>\ntop_v17_dll\x64\rail_api64.dll"（0x14001A578 建 exe 路径，
-	// 0x14001A51C 写假 dll）。所以 base 是 exe 所在目录（<游戏>\x64），
-	// 不是游戏根目录。放错一级 CF 就看不见假 dll，仍然 2310。
-	base := filepath.Dir(exe)
-	if dll, err := selfEnsureHookDLL(base); err != nil {
-		selfLog("释放 hook dll 失败: %v", err)
-		fmt.Printf("注入跳过: %v\n", err)
-	} else {
-		fake := filepath.Join(base, "ntop_v17_dll", "x64", "rail_api64.dll")
-		st, serr := os.Stat(fake)
-		selfLog("hook dll=%s fakeRail=%s statErr=%v", dll, fake, serr)
-		if serr == nil {
-			selfLog("fakeRail size=%d", st.Size())
-		}
-		// 兼容旧位置（游戏根目录），老版本已经在那儿放过文件
-		_, _ = selfEnsureHookDLL(dir)
-		if err := selfInjectHook(pid, dll); err != nil {
-			selfLog("注入失败: %v", err)
-			fmt.Printf("注入失败: %v\n", err)
-		} else {
-			selfLog("注入成功 pid=%d dll=%s", pid, dll)
-		}
-	}
+	_ = selfServeGameRailPipes(pid)
+	go selfWatchGameRailPipes(pid, 45*time.Second)
 
+	// 样本在 CreateProcess 后启动 sub_14000FC70，持续给所有加载 rail_api64.dll
+	// 的进程打 RailNeedRestartAppForCheckingEnvironment 补丁。少了这段，子进程
+	// 重新加载 rail 后仍会弹 2310。
+	go selfPatchRailLoop(filepath.Join(base, "rail_api64.dll"), 10*time.Minute)
+
+	syscall.CloseHandle(proc.Thread)
 	return pid, nil
+}
+
+// selfGameProc 保存 CreateProcessW 的原始句柄；注入必须复用这些句柄。
+type selfGameProc struct {
+	Process   syscall.Handle
+	Thread    syscall.Handle
+	ProcessID uint32
+}
+
+// selfStartGame 对应样本 sub_14001AEE0 的 CreateProcessW：
+// appName=<exe>，commandLine="<exe>" <args>，creationFlags=0x400。
+func selfStartGame(exe, workDir, args string) (*selfGameProc, error) {
+	app, err := syscall.UTF16PtrFromString(exe)
+	if err != nil {
+		return nil, err
+	}
+	cmdLine, err := syscall.UTF16PtrFromString(fmt.Sprintf(`"%s" %s`, exe, args))
+	if err != nil {
+		return nil, err
+	}
+	dir, err := syscall.UTF16PtrFromString(workDir)
+	if err != nil {
+		return nil, err
+	}
+	var si syscall.StartupInfo
+	si.Cb = uint32(unsafe.Sizeof(si))
+	var pi syscall.ProcessInformation
+	if err := syscall.CreateProcess(app, cmdLine, nil, nil, false, 0x400, nil, dir, &si, &pi); err != nil {
+		return nil, err
+	}
+	return &selfGameProc{Process: pi.Process, Thread: pi.Thread, ProcessID: pi.ProcessId}, nil
 }
 
 var (
@@ -284,30 +495,26 @@ func selfHoldSharedMem(h syscall.Handle, v uintptr) {
 	}
 }
 
-
-
-// selfInjectHook 把 qwh_cf_hook.dll 注入目标进程（VirtualAllocEx + WriteProcessMemory + CreateRemoteThread）。
-func selfInjectHook(pid int, dllPath string) error {
+// selfInjectHookHandle 对应样本 sub_14001AEE0 的注入段：
+// 直接复用 CreateProcessW 返回的 hProcess，绝不重新 OpenProcess。
+func selfInjectHookHandle(hProcess syscall.Handle, dllPath string) error {
 	k32 := syscall.NewLazyDLL("kernel32.dll")
-	openProc := k32.NewProc("OpenProcess")
 	virtualAllocEx := k32.NewProc("VirtualAllocEx")
 	writeProcMem := k32.NewProc("WriteProcessMemory")
 	createRemote := k32.NewProc("CreateRemoteThread")
 	waitFor := k32.NewProc("WaitForSingleObject")
+	getExitCode := k32.NewProc("GetExitCodeThread")
 	getModule := k32.NewProc("GetModuleHandleW")
 	getProcAddr := k32.NewProc("GetProcAddress")
 
 	const (
-		processAllAccess = 0x001FFFFF
-		memCommitReserve = 0x3000
+		memCommitReserve  = 0x3000
 		pageExecReadWrite = 0x40
 	)
-
-	hProc, _, _ := openProc.Call(uintptr(pid), 0, processAllAccess)
+	hProc := uintptr(hProcess)
 	if hProc == 0 {
-		return errors.New("OpenProcess 失败")
+		return errors.New("进程句柄为空")
 	}
-	defer syscall.CloseHandle(syscall.Handle(hProc))
 
 	dllUTF16, _ := syscall.UTF16FromString(dllPath)
 	size := uintptr(len(dllUTF16) * 2)
@@ -339,5 +546,12 @@ func selfInjectHook(pid int, dllPath string) error {
 	}
 	defer syscall.CloseHandle(syscall.Handle(hThread))
 	waitFor.Call(hThread, 10000)
+	var exitCode uint32
+	if ok, _, _ := getExitCode.Call(hThread, uintptr(unsafe.Pointer(&exitCode))); ok != 0 {
+		selfLog("LoadLibraryW 远程返回 %#x", exitCode)
+		if exitCode == 0 {
+			return errors.New("LoadLibraryW 返回 0（注入未生效）")
+		}
+	}
 	return nil
 }

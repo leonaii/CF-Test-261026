@@ -25,6 +25,7 @@ type selfOPCache struct {
 	GameST    string `json:"game_st"`
 	GameSTKey string `json:"game_st_key"`
 	PfKey     string `json:"pf_key"`
+	Version   int    `json:"v"` // v2 起 open_key 来自 qq_info_type=6
 	At        int64  `json:"at"`
 }
 
@@ -44,7 +45,9 @@ func selfLoadOPCache(dir, qq string) (*selfOPCache, bool) {
 	if json.Unmarshal(raw, &c) != nil {
 		return nil, false
 	}
-	if c.QQ != qq || c.OpenID == "" {
+	// 旧缓存没有 open_key（EP 里实际是 qq_info.st_key），必须重新登录，
+	// 否则会把空 open_key 和 hex ctt 继续写进 CF_Gamest，游戏仍 2310。
+	if c.QQ != qq || c.OpenID == "" || c.OpenKey == "" || c.Version < 2 {
 		return nil, false
 	}
 	if time.Since(time.UnixMilli(c.At)) > selfOPCacheTTL {
@@ -69,6 +72,7 @@ func selfSaveOPCache(dir string, qq string, d *selfGameTicketData) {
 		GameST:    d.GameST,
 		GameSTKey: d.GameSTKey,
 		PfKey:     d.PfKey,
+		Version:   2,
 		At:        time.Now().UnixMilli(),
 	})
 	if err != nil {
