@@ -295,6 +295,7 @@ check_str() {
 check_str "${CLOUD}/zuhaoclient.exe" "$NEW" "版本号"
 check_str "${CLOUD}/zuhaoclient.exe" "游戏租号客户端" "品牌"
 check_str "${CLOUD}/zuhaoclient.exe" "圆梦上号器" "上号器类型"
+check_str "${CLOUD}/zuhaoclient.exe" "无畏WG上号器" "无畏WG上号器"
 echo "    主程序大小: $(awk "BEGIN{printf \"%.1f\", $(wc -c < "${CLOUD}/zuhaoclient.exe")/1048576}") MB"
 echo "    启动器大小: $(($(wc -c < "${DIST}/CG租号.exe")/1024)) KB"
 echo "    分发包指纹: ${LAUNCHER_FP}"
@@ -441,10 +442,54 @@ EOF
     echo "==> [loader3] 已发布 ${exe_name}"
 }
 
+# 无畏WG 上号器（ID 4）：WeGame 注入版，只有 exe，不读 host.dat。
+# 资源目录与老版无畏共用 ../资源/上号器/wuwei01（可用 WUWEI_ASSET_DIR 覆盖）
+sync_loader_wuwei_wg() {
+    local dir="${WUWEI_ASSET_DIR:-../资源/上号器/wuwei01}"
+    local src="$dir/无畏-WEG.exe"
+    if [ ! -f "$src" ]; then
+        echo "==> [loader4] 跳过：$src 不存在"
+        return 0
+    fi
+    local exe_name="无畏-WEG.exe"
+    local exe_url="%E6%97%A0%E7%95%8F-WEG.exe"
+    local exe_sha exe_size remote
+    exe_sha="$(sha256 "$src")"
+    exe_size="$(wc -c < "$src" | tr -d ' ')"
+    remote="$(curl -s -u "$AUTH" "$BASE/CG/loaders/4/meta.json" || true)"
+    if echo "$remote" | grep -q "$exe_sha" && echo "$remote" | grep -q "$exe_name"; then
+        echo "==> [loader4] 云端已是最新（${exe_name}），跳过上传"
+        return 0
+    fi
+    echo "==> [loader4] 上传 ${exe_name} ($((exe_size/1024/1024)) MB)"
+    curl -sS -u "$AUTH" -X MKCOL "$BASE/CG/" >/dev/null || true
+    curl -sS -u "$AUTH" -X MKCOL "$BASE/CG/loaders/" >/dev/null || true
+    curl -sS -u "$AUTH" -X MKCOL "$BASE/CG/loaders/4/" >/dev/null || true
+    curl -sS -u "$AUTH" -T "$src" "$BASE/CG/loaders/4/${exe_url}" >/dev/null
+
+    local meta
+    meta="$(mktemp)"
+    cat > "$meta" <<EOF
+{
+  "id": "4",
+  "name": "无畏WG上号器",
+  "exe": "${exe_name}",
+  "exe_sha256": "$exe_sha",
+  "exe_size": $exe_size,
+  "dat_sha256": "",
+  "updated": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    curl -sS -u "$AUTH" -T "$meta" "$BASE/CG/loaders/4/meta.json" >/dev/null
+    rm -f "$meta"
+    echo "==> [loader4] 已发布 ${exe_name}"
+}
+
 if [ "$SYNC_LOADER" = "1" ]; then
     sync_loader
     sync_loader_jige
     sync_loader_wuwei
+    sync_loader_wuwei_wg
 fi
 
 if [ "$PUBLISH" = "1" ]; then
