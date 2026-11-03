@@ -34,6 +34,7 @@ func (a *guiApp) ymmPage() Widget {
 		PushButton{AssignTo: &a.ymm.btnVerify, Text: "①查封", MinSize: Size{Width: 80, Height: btnH}, OnClicked: a.ymmQuerySelected},
 		PushButton{Text: "②新上号", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchNewClick},
 		PushButton{Text: "②老上号", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchOldClick},
+		PushButton{Text: "②无畏上号", MinSize: Size{Width: 104, Height: btnH}, OnClicked: a.ymmLaunchWuweiClick},
 		// 自研上号暂时下线（2310 未解决），保留入口但置灰。
 		PushButton{AssignTo: &a.ymm.btnSelfOp, Text: "③自研上号", Enabled: false, MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.ymmSelfOpClick},
 		PushButton{Text: "复制卡密", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmCopyCard},
@@ -448,6 +449,106 @@ func (a *guiApp) ymmLaunchOldClick() {
 		return
 	}
 	a.ymmLaunchYuanmeng(row)
+}
+
+// ymmLaunchWuweiClick 无畏上号：无畏契约上号器（本地假卡密服务 + 改 exe 内置服务器地址）。
+func (a *guiApp) ymmLaunchWuweiClick() {
+	row, ok := a.ymm.selected()
+	if !ok {
+		a.ymm.logf("请先选中一行")
+		return
+	}
+	a.ymmLaunchWuwei(row)
+}
+
+// ymmLaunchWuwei 用选中行的 QQ 从数据源取 ini，喂给无畏上号器。
+func (a *guiApp) ymmLaunchWuwei(row ymmRow) {
+	if row.QQ == "" {
+		a.ymm.logf("该行缺少 QQ")
+		return
+	}
+
+	dir := wuweiWorkDir(a.dir)
+	a.ymm.logf("无畏上号：QQ %s", row.QQ)
+
+	go func() {
+		a.ui(a.spinBegin)
+		defer a.ui(a.spinEnd)
+
+		// 和新老上号器一样按需下载；云端拿不到再退回本地文件/让用户选
+		launcher, err := a.ensureLoaderFor(findProfile("3"))
+		if err != nil {
+			launcher, err = wuweiEnsureLocal(dir)
+		}
+		if err != nil {
+			var pickErr error
+			a.ui(func() { launcher, pickErr = a.wuweiPickLauncher() })
+			if pickErr != nil || launcher == "" {
+				msg := "未选择上号器"
+				if pickErr != nil {
+					msg = pickErr.Error()
+				}
+				a.ui(func() { a.ymm.logf("无畏上号：%s", msg) })
+				return
+			}
+		}
+
+		src := "卡密平台"
+		if a.ymm.isDump() {
+			src = "离线数据源"
+		}
+		a.ui(func() { a.ymm.logf("取票据（%s）…", src) })
+
+		ini, err := a.ymmSelfIni(row.QQ)
+		if err != nil {
+			a.ui(func() { a.ymm.logf("取票据失败: %v", err) })
+			return
+		}
+		// 无畏上号器解出明文后只认这两个标记；都没有就不用拉起上号器了
+		if !strings.Contains(ini, "Token010A=") && !strings.Contains(ini, "openid=") {
+			a.ui(func() { a.ymm.logf("该账号的 ini 缺少 Token010A/openid，无畏上号器用不了") })
+			return
+		}
+
+		appendHistory(a.dir, histEntry{
+			TS:     time.Now().UnixMilli(),
+			Action: "wuwei",
+			QQ:     row.QQ,
+			Card:   row.CardKey,
+			Note:   row.Note,
+			Zone:   row.Area,
+			Result: "已启动",
+		})
+
+		err = wuweiLaunchOffline(launcher, dir, ini, row.QQ, row.Area, func(f string, args ...any) {
+			a.ui(func() { a.ymm.logf(f, args...) })
+		})
+		if err != nil {
+			a.ui(func() { a.ymm.logf("失败: %v", err) })
+			return
+		}
+		a.ui(func() { a.ymm.logf("无畏上号器已退出") })
+	}()
+}
+
+// wuweiPickLauncher 本地找不到无畏上号器时让用户选一次，并复制到工作目录。
+func (a *guiApp) wuweiPickLauncher() (string, error) {
+	dlg := &walk.FileDialog{
+		Title:  "选择 无畏上号器.exe",
+		Filter: "上号器 (*.exe)|*.exe|所有文件 (*.*)|*.*",
+	}
+	ok, err := dlg.ShowOpen(a.mw)
+	if err != nil {
+		return "", err
+	}
+	if !ok || dlg.FilePath == "" {
+		return "", fmt.Errorf("已取消")
+	}
+	dst := filepath.Join(wuweiWorkDir(a.dir), wuweiExeName)
+	if err := copyFileLocal(dlg.FilePath, dst); err != nil {
+		return "", fmt.Errorf("复制上号器失败: %w", err)
+	}
+	return dst, nil
 }
 
 // ensureLoaderFor 按需准备指定上号器：本地已有直接用，否则从云端下载。

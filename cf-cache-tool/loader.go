@@ -41,6 +41,13 @@ var loaderProfiles = []loaderProfile{
 		Site:     "https://www.517fk.cn/links/8B1B512A",
 		SiteNote: "0V-10V / 10V-19V / 20V-49V / 50-99V 这家的",
 	},
+	{
+		ID:        "3",
+		Name:      "无畏上号器",
+		ExeName:   wuweiExeName,
+		SiteNote:  "无畏契约上号器，离线票据桥接",
+		NoHostDat: true, // 不读 host.dat，靠改 exe 内置地址 + 本地假卡密服务
+	},
 }
 
 func findProfile(id string) *loaderProfile {

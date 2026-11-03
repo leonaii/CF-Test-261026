@@ -207,6 +207,8 @@ func histActionLabel(a string) string {
 	switch a {
 	case "offline":
 		return "②上号"
+	case "wuwei":
+		return "②无畏上号"
 	case "selfop":
 		return "③自研上号"
 	case "verify":
@@ -233,7 +235,7 @@ func ymmHistoryRows(dir, kw string) []ymmRow {
 	// 先按关键字过滤（搜索时次数只统计命中的那些）
 	matched := make([]histEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.Action != "offline" && e.Action != "selfop" { // 历史只看上号记录，查封不进列表
+		if e.Action != "offline" && e.Action != "selfop" && e.Action != "wuwei" { // 历史只看上号记录，查封不进列表
 			continue
 		}
 		if kw != "" && !histEntryMatch(e, kw) {

@@ -105,7 +105,8 @@ func ensureLocalLoader(dir string, p *loaderProfile) (string, error) {
 	base, _ := os.Executable()
 	exeDir := filepath.Dir(base)
 	names := []string{p.ExeName}
-	if p.NoHostDat {
+	// 只有鸡哥有历史文件名；无畏也是 NoHostDat，不能把鸡哥的 exe 当成无畏拷过来
+	if p.NoHostDat && p.ID == "2" {
 		names = append(names, "鸡哥直登.exe")
 	}
 	for _, name := range names {
