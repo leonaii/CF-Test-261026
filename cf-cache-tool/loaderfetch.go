@@ -123,6 +123,12 @@ func ensureLocalLoader(dir string, p *loaderProfile) (string, error) {
 			filepath.Join(exeDir, "..", "资源", "上号器", "niubi", name),
 			filepath.Join(exeDir, "..", "..", "资源", "上号器", "niubi", name),
 		)
+		// 无畏 / 无畏WG 的资源同放在 wuwei01 目录
+		cands = append(cands,
+			filepath.Join(exeDir, "资源", "上号器", "wuwei01", name),
+			filepath.Join(exeDir, "..", "资源", "上号器", "wuwei01", name),
+			filepath.Join(exeDir, "..", "..", "资源", "上号器", "wuwei01", name),
+		)
 		for _, c := range cands {
 			st, err := os.Stat(c)
 			if err != nil || st.Size() == 0 {

@@ -48,6 +48,13 @@ var loaderProfiles = []loaderProfile{
 		SiteNote:  "无畏契约上号器，离线票据桥接",
 		NoHostDat: true, // 不读 host.dat，靠改 exe 内置地址 + 本地假卡密服务
 	},
+	{
+		ID:        "4",
+		Name:      "无畏WG上号器",
+		ExeName:   wuweiWGExeName,
+		SiteNote:  "无畏契约 WeGame 注入版，离线票据桥接（需先登录官方 WeGame）",
+		NoHostDat: true, // 与老版无畏同源，改 exe 内置地址 + 本地假卡密服务
+	},
 }
 
 func findProfile(id string) *loaderProfile {

@@ -35,9 +35,17 @@ func (a *guiApp) ymmPage() Widget {
 		PushButton{Text: "②新上号", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchNewClick},
 		PushButton{Text: "②老上号", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchOldClick},
 		PushButton{Text: "②无畏上号", MinSize: Size{Width: 104, Height: btnH}, OnClicked: a.ymmLaunchWuweiClick},
+		PushButton{Text: "②无畏WG", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchWuweiWGClick},
 		// 自研上号暂时下线（2310 未解决），保留入口但置灰。
 		PushButton{AssignTo: &a.ymm.btnSelfOp, Text: "③自研上号", Enabled: false, MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.ymmSelfOpClick},
 		PushButton{Text: "复制卡密", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmCopyCard},
+		HSpacer{},
+	}
+	// 数据源 / 使用代理 / 切换上号器 统一放本页右下角，操作行只留上号按钮，
+	// 这样新增「②无畏WG」也不会把这一行挤掉。
+	statusKids := []Widget{
+		Label{AssignTo: &a.ymm.label, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+		HSpacer{},
 		PushButton{AssignTo: &a.ymm.btnSource, Text: "数据源：在线", MinSize: Size{Width: 110, Height: btnH}, OnClicked: func() { a.ymm.toggleSource() }},
 		CheckBox{
 			AssignTo: &a.ymm.chkProxy,
@@ -74,15 +82,7 @@ func (a *guiApp) ymmPage() Widget {
 			MinSize:   Size{Width: 220},
 			Visible:   false,
 		},
-		HSpacer{},
-	}
-	statusKids := []Widget{
-		Label{AssignTo: &a.ymm.label, Text: "", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
-		HSpacer{},
-	}
-	// 精简模式没有顶部栏：把「切换上号器」挂到这一页，否则退不回第一界面
-	if a.slim {
-		ops = append(ops, PushButton{Text: "切换上号器", MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.reconfigure})
+		PushButton{Text: "切换上号器", MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.reconfigure},
 	}
 
 	children := []Widget{
@@ -468,12 +468,19 @@ func (a *guiApp) ymmLaunchWuwei(row ymmRow) {
 		return
 	}
 
+	// 预检：只看本机环境（Riot 登录缓存 / ACLOS 代理），不猜账号类型
+	a.ymm.logf("预检：%s", wuweiRunPrecheck().summary())
+
 	dir := wuweiWorkDir(a.dir)
 	a.ymm.logf("无畏上号：QQ %s", row.QQ)
 
 	go func() {
 		a.ui(a.spinBegin)
 		defer a.ui(a.spinEnd)
+
+		if err := wuweiRiotCDNReachable(); err != nil {
+			a.ui(func() { a.ymm.logf("预检：Riot ToS 域名连不上（%v），新号会报 VAL 29", err) })
+		}
 
 		// 和新老上号器一样按需下载；云端拿不到再退回本地文件/让用户选
 		launcher, err := a.ensureLoaderFor(findProfile("3"))
@@ -510,6 +517,20 @@ func (a *guiApp) ymmLaunchWuwei(row ymmRow) {
 			return
 		}
 
+		// 按真实卡密服务器下发的票据格式裁剪/改名（6 键、大写、CRLF）
+		ticket, realQQ, debug, err := wuweiLoadTicket(dir, ini, row.QQ)
+		if err != nil {
+			a.ui(func() { a.ymm.logf("票据转换失败: %v", err) })
+			return
+		}
+		if debug {
+			a.ui(func() { a.ymm.logf("排障：使用 wuwei/real_ticket.ini 的真实票据（QQ %s）", realQQ) })
+		} else {
+			a.ui(func() {
+				a.ymm.logf("票据已按真实下发票格式转换（QQ %s，%d 字节）", realQQ, len(ticket))
+			})
+		}
+
 		appendHistory(a.dir, histEntry{
 			TS:     time.Now().UnixMilli(),
 			Action: "wuwei",
@@ -520,7 +541,7 @@ func (a *guiApp) ymmLaunchWuwei(row ymmRow) {
 			Result: "已启动",
 		})
 
-		err = wuweiLaunchOffline(launcher, dir, ini, row.QQ, row.Area, func(f string, args ...any) {
+		err = wuweiLaunchOffline(launcher, dir, ticket, realQQ, func(f string, args ...any) {
 			a.ui(func() { a.ymm.logf(f, args...) })
 		})
 		if err != nil {
@@ -529,6 +550,123 @@ func (a *guiApp) ymmLaunchWuwei(row ymmRow) {
 		}
 		a.ui(func() { a.ymm.logf("无畏上号器已退出") })
 	}()
+}
+
+// ymmLaunchWuweiWGClick ②无畏WG：WeGame 注入版（本地假卡密服务 + 改 exe 内置服务器地址）。
+func (a *guiApp) ymmLaunchWuweiWGClick() {
+	row, ok := a.ymm.selected()
+	if !ok {
+		a.ymm.logf("请先选中一行")
+		return
+	}
+	a.ymmLaunchWuweiWG(row)
+}
+
+// ymmLaunchWuweiWG 与老版无畏同源：取同一份 ini、用同一套信封与地址补丁，
+// 只是换成注入官方 WeGame 的 WEG 版 exe 和独立工作目录。
+func (a *guiApp) ymmLaunchWuweiWG(row ymmRow) {
+	if row.QQ == "" {
+		a.ymm.logf("该行缺少 QQ")
+		return
+	}
+
+	// WEG 不自己造登录态，硬前提是官方 WeGame 已登录；只提示，不弹框拦人
+	a.ymm.logf("预检：%s", wuweiWGWeGameState())
+
+	dir := wuweiWGWorkDir(a.dir)
+	a.ymm.logf("无畏WG：QQ %s", row.QQ)
+
+	go func() {
+		a.ui(a.spinBegin)
+		defer a.ui(a.spinEnd)
+
+		// 按需从云端下载 ID 4 的 无畏-WEG.exe，拿不到再退回本地/让用户选
+		launcher, err := a.ensureLoaderFor(findProfile("4"))
+		if err != nil {
+			launcher, err = wuweiWGEnsureLocal(dir)
+		}
+		if err != nil {
+			var pickErr error
+			a.ui(func() { launcher, pickErr = a.wuweiWGPickLauncher() })
+			if pickErr != nil || launcher == "" {
+				msg := "未选择上号器"
+				if pickErr != nil {
+					msg = pickErr.Error()
+				}
+				a.ui(func() { a.ymm.logf("无畏WG：%s", msg) })
+				return
+			}
+		}
+
+		src := "卡密平台"
+		if a.ymm.isDump() {
+			src = "离线数据源"
+		}
+		a.ui(func() { a.ymm.logf("取票据（%s）…", src) })
+
+		ini, err := a.ymmSelfIni(row.QQ)
+		if err != nil {
+			a.ui(func() { a.ymm.logf("取票据失败: %v", err) })
+			return
+		}
+		if !strings.Contains(ini, "Token010A=") && !strings.Contains(ini, "openid=") {
+			a.ui(func() { a.ymm.logf("该账号的 ini 缺少 Token010A/openid，无畏WG 用不了") })
+			return
+		}
+
+		// WEG 与老版同源，沿用真实服务器下发的 6 键大写票据（幂等）
+		ticket, realQQ, debug, err := wuweiLoadTicket(dir, ini, row.QQ)
+		if err != nil {
+			a.ui(func() { a.ymm.logf("票据转换失败: %v", err) })
+			return
+		}
+		if debug {
+			a.ui(func() { a.ymm.logf("排障：使用 wuwei-weg/real_ticket.ini 的真实票据（QQ %s）", realQQ) })
+		} else {
+			a.ui(func() {
+				a.ymm.logf("票据已按真实下发票格式转换（QQ %s，%d 字节）", realQQ, len(ticket))
+			})
+		}
+
+		appendHistory(a.dir, histEntry{
+			TS:     time.Now().UnixMilli(),
+			Action: "wuwei-wg",
+			QQ:     row.QQ,
+			Card:   row.CardKey,
+			Note:   row.Note,
+			Zone:   row.Area,
+			Result: "已启动",
+		})
+
+		err = wuweiWGLaunchOffline(launcher, dir, ticket, realQQ, func(f string, args ...any) {
+			a.ui(func() { a.ymm.logf(f, args...) })
+		})
+		if err != nil {
+			a.ui(func() { a.ymm.logf("失败: %v", err) })
+			return
+		}
+		a.ui(func() { a.ymm.logf("无畏WG 已退出") })
+	}()
+}
+
+// wuweiWGPickLauncher 本地/云端都没有 WEG 上号器时让用户选一次，并复制到工作目录。
+func (a *guiApp) wuweiWGPickLauncher() (string, error) {
+	dlg := &walk.FileDialog{
+		Title:  "选择 无畏-WEG.exe",
+		Filter: "上号器 (*.exe)|*.exe|所有文件 (*.*)|*.*",
+	}
+	ok, err := dlg.ShowOpen(a.mw)
+	if err != nil {
+		return "", err
+	}
+	if !ok || dlg.FilePath == "" {
+		return "", fmt.Errorf("已取消")
+	}
+	dst := filepath.Join(wuweiWGWorkDir(a.dir), wuweiWGExeName)
+	if err := copyFileLocal(dlg.FilePath, dst); err != nil {
+		return "", fmt.Errorf("复制上号器失败: %w", err)
+	}
+	return dst, nil
 }
 
 // wuweiPickLauncher 本地找不到无畏上号器时让用户选一次，并复制到工作目录。

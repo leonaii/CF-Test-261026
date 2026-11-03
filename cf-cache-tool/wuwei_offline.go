@@ -69,9 +69,10 @@ func wuweiEncodeURL(s string) []byte {
 	return out
 }
 
-// wuweiPatchExe 返回改好地址的 exe 内容（不修改入参）。
-func wuweiPatchExe(raw []byte) ([]byte, error) {
-	if len(wuweiLocalURL) != len(wuweiStubURL) {
+// wuweiPatchExeURL 返回改好地址的 exe 内容（不修改入参）。
+// 老版与 WEG 版共用同一段 24 字节 XOR 槽位和 FNV-1a64 校验常量，只换本地地址。
+func wuweiPatchExeURL(raw []byte, localURL string) ([]byte, error) {
+	if len(localURL) != len(wuweiStubURL) {
 		return nil, fmt.Errorf("本地地址必须和原地址等长（%d 字节）", len(wuweiStubURL))
 	}
 
@@ -89,9 +90,14 @@ func wuweiPatchExe(raw []byte) ([]byte, error) {
 	}
 
 	out := append([]byte(nil), raw...)
-	copy(out[slot:slot+len(wuweiStubURL)], wuweiEncodeURL(wuweiLocalURL))
-	binary.LittleEndian.PutUint64(out[check+2:check+10], wuweiFNV64(wuweiLocalURL))
+	copy(out[slot:slot+len(wuweiStubURL)], wuweiEncodeURL(localURL))
+	binary.LittleEndian.PutUint64(out[check+2:check+10], wuweiFNV64(localURL))
 	return out, nil
+}
+
+// wuweiPatchExe 老版无畏上号器用默认本地地址。
+func wuweiPatchExe(raw []byte) ([]byte, error) {
+	return wuweiPatchExeURL(raw, wuweiLocalURL)
 }
 
 // wuweiPrepareExe 读原始 exe，生成/复用打过补丁的副本。
@@ -117,14 +123,87 @@ func wuweiPrepareExe(src, dir string) (string, error) {
 	return dst, nil
 }
 
-// wuweiStartServer 起本地假卡密服务。所有路径用后缀匹配，避免路径前缀被客户端改写。
-func wuweiStartServer(ini, qq, zone string) (func(), error) {
+// wuweiConvertTicket 把 dump 出来的 WeGame 缓存（16 键、小写）转换成真实卡密服务器
+// 下发的票据格式（6 键、大写、CRLF）。2026-11-03 用真卡密实测得到：
+//
+//	[QQ]
+//	Token010A=...      ← dump: Token010A
+//	Token0143=...      ← dump: Token0143
+//	Sessionkey=...     ← dump: sessionKey
+//	CT=...             ← dump: ct
+//	TGPID=...          ← dump: tgpid
+//	machine_id=...     ← dump: machine_id
+//
+// 内容同源（字段值长度也一一对应），但真实服务器只发这 6 个键、用大写键名；
+// dump 里多出的 Token0106 / uid / ctid / dt / st / biz_ticket / client_key /
+// st_key / sig 一律丢掉。函数对「已经是真票格式」的输入同样适用（幂等）。
+func wuweiConvertTicket(ini, qq string) (ticket, realQQ string, err error) {
+	vals := map[string]string{}
+	section := ""
+	for _, line := range strings.Split(strings.ReplaceAll(ini, "\r\n", "\n"), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, ";") || strings.HasPrefix(t, "#") {
+			continue
+		}
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			section = strings.Trim(t, "[]")
+			continue
+		}
+		if k, v, ok := strings.Cut(t, "="); ok {
+			vals[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+		}
+	}
+	if qq == "" {
+		qq = section
+	}
+	if qq == "" {
+		return "", "", fmt.Errorf("票据里没有 [QQ] 段")
+	}
+
+	need := []struct{ real, src string }{
+		{"Token010A", "token010a"},
+		{"Token0143", "token0143"},
+		{"Sessionkey", "sessionkey"},
+		{"CT", "ct"},
+		{"TGPID", "tgpid"},
+		{"machine_id", "machine_id"},
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s]\r\n", qq)
+	for i, n := range need {
+		v := vals[n.src]
+		if v == "" {
+			return "", "", fmt.Errorf("票据缺字段 %s（对应 %s）", n.src, n.real)
+		}
+		fmt.Fprintf(&b, "%s=%s", n.real, v)
+		// 真票最后一行 machine_id 后面没有换行，严格对齐
+		if i < len(need)-1 {
+			b.WriteString("\r\n")
+		}
+	}
+	return b.String(), qq, nil
+}
+
+// wuweiLoadTicket 排障用：工作目录里放了 real_ticket.ini 就优先用它，
+// 方便拿真实卡密的明文直接验证本地桥，不用改界面/数据源。
+func wuweiLoadTicket(dir, ini, qq string) (ticket, realQQ string, debug bool, err error) {
+	if b, e := os.ReadFile(filepath.Join(dir, "real_ticket.ini")); e == nil && len(b) > 0 {
+		t, q, e2 := wuweiConvertTicket(string(b), "")
+		if e2 == nil {
+			return t, q, true, nil
+		}
+	}
+	t, q, e := wuweiConvertTicket(ini, qq)
+	return t, q, false, e
+}
+
+// wuweiStartServerAt 起本地假卡密服务。所有路径用后缀匹配，避免路径前缀被客户端改写。
+// 回包字段与真实卡密服务器对齐（name/zone 都是空串，不塞 CF 区服）。
+// 老版与 WEG 版共用同一套信封/回包，只是监听端口不同（避免互相顶掉）。
+func wuweiStartServerAt(ini, qq, addr string) (func(), error) {
 	env, err := jigeSeal([]byte(ini))
 	if err != nil {
 		return nil, fmt.Errorf("封信封失败: %w", err)
-	}
-	if strings.TrimSpace(zone) == "" {
-		zone = "无畏契约"
 	}
 
 	reply := func(w http.ResponseWriter, v any) {
@@ -135,13 +214,11 @@ func wuweiStartServer(ini, qq, zone string) (func(), error) {
 		var req map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		out := map[string]any{
-			"ok":          true,
-			"qq":          qq,
-			"zone":        zone,
-			"note":        zone,
-			"extra":       zone,
-			"activated":   true,
-			"valid_hours": ymmValidHours,
+			"ok": true,
+			"qq": qq,
+			// 真实服务器这两个字段都是空串
+			"name": "",
+			"zone": "",
 			// 离线不看卡密状态：有效期一律给 10 年
 			"expires_at": time.Now().Add(ymmValidSpan).UnixMilli(),
 		}
@@ -167,13 +244,18 @@ func wuweiStartServer(ini, qq, zone string) (func(), error) {
 		}
 	}
 
-	ln, err := net.Listen("tcp", wuweiListenAddr)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("本地端口 %s 被占用: %w", wuweiListenAddr, err)
+		return nil, fmt.Errorf("本地端口 %s 被占用: %w", addr, err)
 	}
 	srv := &http.Server{Handler: http.HandlerFunc(h)}
 	go func() { _ = srv.Serve(ln) }()
 	return func() { _ = srv.Close() }, nil
+}
+
+// wuweiStartServer 老版无畏上号器用默认端口。
+func wuweiStartServer(ini, qq string) (func(), error) {
+	return wuweiStartServerAt(ini, qq, wuweiListenAddr)
 }
 
 // wuweiWriteConfig 写 [ui] 段：占位卡密 + 已选的 ACLOS 代理路径，其余键原样保留。
@@ -305,7 +387,7 @@ func wuweiEnsureLocal(workDir string) (string, error) {
 }
 
 // wuweiLaunchOffline 离线上号主流程：生成补丁副本 → 起本地卡密服务 → 写 config.ini → 启动上号器。
-func wuweiLaunchOffline(launcher, workDir, ini, qq, zone string, logf func(string, ...any)) error {
+func wuweiLaunchOffline(launcher, workDir, ini, qq string, logf func(string, ...any)) error {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
@@ -317,7 +399,7 @@ func wuweiLaunchOffline(launcher, workDir, ini, qq, zone string, logf func(strin
 	if err != nil {
 		return err
 	}
-	stop, err := wuweiStartServer(ini, qq, zone)
+	stop, err := wuweiStartServer(ini, qq)
 	if err != nil {
 		return err
 	}
