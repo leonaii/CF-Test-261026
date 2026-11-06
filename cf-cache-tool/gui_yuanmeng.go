@@ -485,6 +485,9 @@ func (s *ymmPageState) logf(format string, args ...any) {
 		s.app.runLog.line("%s", line)
 	}
 	if s.logBox == nil {
+		// 精简模式（非 leonai 卡密）不创建日志框：把最新一行显示在底部状态栏，
+		// 否则 ymm.logf 的内容既不显示也不落盘（runLog 在 slim 下被清空）。
+		s.setLabel(line)
 		return
 	}
 	s.logBox.AppendText(line + "\r\n")

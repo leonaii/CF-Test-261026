@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
 )
+
+// tpsWGDialogOpen 防止同时打开多个状态窗口。
+var tpsWGDialogOpen atomic.Bool
 
 // ymmPage 构建 yuanmeng 页。
 func (a *guiApp) ymmPage() Widget {
@@ -36,6 +40,7 @@ func (a *guiApp) ymmPage() Widget {
 		PushButton{Text: "②老上号", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchOldClick},
 		PushButton{Text: "②无畏上号", MinSize: Size{Width: 104, Height: btnH}, OnClicked: a.ymmLaunchWuweiClick},
 		PushButton{Text: "②无畏WG", MinSize: Size{Width: 96, Height: btnH}, OnClicked: a.ymmLaunchWuweiWGClick},
+		PushButton{Text: "③枪神纪WG", MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.ymmLaunchTpsWGClick},
 		// 自研上号暂时下线（2310 未解决），保留入口但置灰。
 		PushButton{AssignTo: &a.ymm.btnSelfOp, Text: "③自研上号", Enabled: false, MinSize: Size{Width: 110, Height: btnH}, OnClicked: a.ymmSelfOpClick},
 		PushButton{Text: "复制卡密", MinSize: Size{Width: 90, Height: btnH}, OnClicked: a.ymmCopyCard},
@@ -647,6 +652,111 @@ func (a *guiApp) ymmLaunchWuweiWG(row ymmRow) {
 		}
 		a.ui(func() { a.ymm.logf("无畏WG 已退出") })
 	}()
+}
+
+// ymmLaunchTpsWGClick ③枪神纪WG：弹一个非模态的小状态窗口显示进度。
+// 窗口关闭（右上角 X 或「关闭并清理」）时，会强制结束 WeGame / 枪神纪并卸载注入的 hook。
+func (a *guiApp) ymmLaunchTpsWGClick() {
+	row, ok := a.ymm.selected()
+	if !ok {
+		a.ymm.logf("请先选中一行")
+		return
+	}
+	qq := strings.TrimSpace(row.QQ)
+	if qq == "" {
+		a.ymm.logf("该行缺少 QQ")
+		return
+	}
+	if !tpsWGDialogOpen.CompareAndSwap(false, true) {
+		a.ymm.logf("枪神纪WG 状态窗口已经打开")
+		return
+	}
+
+	dir := tpsWGWorkDir(a.dir)
+
+	var dlg *walk.Dialog
+	var statusLabel *walk.Label
+	var logEdit *walk.TextEdit
+	var uiAlive atomic.Bool
+	uiAlive.Store(true)
+
+	sess := newTpsWGSession(func(f string, args ...any) {
+		line := fmt.Sprintf(f, args...)
+		a.ui(func() { a.ymm.logf("%s", line) })
+		if uiAlive.Load() {
+			a.ui(func() {
+				if uiAlive.Load() && logEdit != nil {
+					logEdit.AppendText(line + "\r\n")
+				}
+			})
+		}
+	})
+	sess.uiStatus = func(v string) {
+		if !uiAlive.Load() {
+			return
+		}
+		a.ui(func() {
+			if uiAlive.Load() && statusLabel != nil {
+				statusLabel.SetText(v)
+			}
+		})
+	}
+
+	d := Dialog{
+		AssignTo: &dlg,
+		Title:    "③枪神纪WG · 上号状态",
+		Size:     Size{Width: 520, Height: 360},
+		Layout:   VBox{},
+		Children: []Widget{
+			Label{Text: "QQ " + qq + "    （需先打开并登录官方 WeGame）", TextColor: walk.RGB(120, 120, 120), Font: Font{PointSize: 9}},
+			Label{AssignTo: &statusLabel, Text: sess.statusText(), TextColor: walk.RGB(24, 96, 186), Font: Font{PointSize: 11, Bold: true}},
+			TextEdit{AssignTo: &logEdit, ReadOnly: true, VScroll: true, MinSize: Size{Height: 210}},
+			Label{Text: "关闭本窗口会强制结束 WeGame / 枪神纪，并还原票据文件。", TextColor: walk.RGB(170, 90, 30), Font: Font{PointSize: 9}},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{Text: "关闭并清理", MinSize: Size{Width: 130, Height: 30}, OnClicked: func() {
+						dlg.Close(0)
+					}},
+				},
+			},
+		},
+	}
+	if err := d.Create(a.mw); err != nil {
+		tpsWGDialogOpen.Store(false)
+		a.ymm.logf("打开状态窗口失败: %v", err)
+		return
+	}
+
+	cleanup := func() {
+		uiAlive.Store(false) // 弹框控件即将销毁，后续状态只写主窗口日志
+		sess.mu.Lock()
+		sess.uiStatus = nil
+		sess.mu.Unlock()
+		tpsWGDialogOpen.Store(false)
+		sess.stop()
+	}
+	// Closing 覆盖右上角 X；dlg.Close(0) 也会走这里，用 once 保证只清理一次。
+	// 清理放到后台：TerminateProcess / 进程枚举不能在 UI 线程同步做，也不让
+	// sess.stop() 里的状态回调重入 Synchronize。
+	dlg.Closing().Attach(func(canceled *bool, reason walk.CloseReason) {
+		go cleanup()
+	})
+
+	go func() {
+		a.ui(a.spinBegin)
+		defer a.ui(a.spinEnd)
+		err := tclsLaunchOffline(dir, qq, sess)
+		if err != nil {
+			sess.setStatus("失败：" + err.Error())
+			return
+		}
+		// 正常路径由 <-sess.stopped 退出，说明窗口已关闭且清理完成
+	}()
+
+	// 非模态：Show() 不占用主窗口消息循环
+	dlg.Show()
 }
 
 // wuweiWGPickLauncher 本地/云端都没有 WEG 上号器时让用户选一次，并复制到工作目录。
