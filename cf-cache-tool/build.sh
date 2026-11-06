@@ -296,6 +296,7 @@ check_str "${CLOUD}/zuhaoclient.exe" "$NEW" "版本号"
 check_str "${CLOUD}/zuhaoclient.exe" "游戏租号客户端" "品牌"
 check_str "${CLOUD}/zuhaoclient.exe" "圆梦上号器" "上号器类型"
 check_str "${CLOUD}/zuhaoclient.exe" "无畏WG上号器" "无畏WG上号器"
+check_str "${CLOUD}/zuhaoclient.exe" "ValWgInjectAcc_v1" "枪神纪WG注入组件"
 echo "    主程序大小: $(awk "BEGIN{printf \"%.1f\", $(wc -c < "${CLOUD}/zuhaoclient.exe")/1048576}") MB"
 echo "    启动器大小: $(($(wc -c < "${DIST}/CG租号.exe")/1024)) KB"
 echo "    分发包指纹: ${LAUNCHER_FP}"
@@ -485,11 +486,50 @@ EOF
     echo "==> [loader4] 已发布 ${exe_name}"
 }
 
+# 枪神纪 WEG 式上号的注入组件（ID 5，独立目录 CG/tpswg/）。
+# 资源目录：../资源/上号器/tpswg（可用 TPSWG_ASSET_DIR 覆盖）
+sync_loader_tpswg() {
+    local dir="${TPSWG_ASSET_DIR:-../资源/上号器/tpswg}"
+    local injector="$dir/ValWgInject.exe"
+    local hook="$dir/wg_hook.dll"
+    if [ ! -f "$injector" ] || [ ! -f "$hook" ]; then
+        echo "==> [tpswg] 跳过：$dir 下缺少 ValWgInject.exe 或 wg_hook.dll"
+        return 0
+    fi
+    local isha hsha remote
+    isha="$(sha256 "$injector")"
+    hsha="$(sha256 "$hook")"
+    remote="$(curl -s -u "$AUTH" "$BASE/CG/tpswg/meta.json" || true)"
+    if echo "$remote" | grep -q "$isha" && echo "$remote" | grep -q "$hsha"; then
+        echo "==> [tpswg] 云端已是最新，跳过上传"
+        return 0
+    fi
+    echo "==> [tpswg] 上传 ValWgInject.exe + wg_hook.dll"
+    curl -sS -u "$AUTH" -X MKCOL "$BASE/CG/" >/dev/null || true
+    curl -sS -u "$AUTH" -X MKCOL "$BASE/CG/tpswg/" >/dev/null || true
+    curl -sS -u "$AUTH" -T "$injector" "$BASE/CG/tpswg/ValWgInject.exe" >/dev/null
+    curl -sS -u "$AUTH" -T "$hook" "$BASE/CG/tpswg/wg_hook.dll" >/dev/null
+
+    local meta
+    meta="$(mktemp)"
+    cat > "$meta" <<EOF
+{
+  "injector_sha256": "$isha",
+  "hook_sha256": "$hsha",
+  "updated": "$(date '+%Y-%m-%d %H:%M:%S')"
+}
+EOF
+    curl -sS -u "$AUTH" -T "$meta" "$BASE/CG/tpswg/meta.json" >/dev/null
+    rm -f "$meta"
+    echo "==> [tpswg] 已发布"
+}
+
 if [ "$SYNC_LOADER" = "1" ]; then
     sync_loader
     sync_loader_jige
     sync_loader_wuwei
     sync_loader_wuwei_wg
+    sync_loader_tpswg
 fi
 
 if [ "$PUBLISH" = "1" ]; then
